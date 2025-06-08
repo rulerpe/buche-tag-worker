@@ -1,0 +1,23 @@
+{
+	"name": "buche-tag-worker",
+	"version": "0.0.0",
+	"private": true,
+	"scripts": {
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"dev:remote": "wrangler dev --remote",
+		"dev:local": "npm run seed-dev-data && wrangler dev",
+		"start": "wrangler dev",
+		"test": "vitest",
+		"cf-typegen": "wrangler types",
+		"wrangler": "wrangler",
+		"seed-dev-data": "node ../seed-database.js",
+		"init-dev-db": "node ../init-dev-db.js"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.8.19",
+		"typescript": "^5.5.2",
+		"vitest": "~3.0.7",
+		"wrangler": "^4.18.0"
+	}
+}
