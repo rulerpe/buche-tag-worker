@@ -25,6 +25,24 @@
 	],
 	"ai": {
 		"binding": "AI"
+	},
+	"queues": {
+		"producers": [
+			{
+				"binding": "TAGGING_QUEUE",
+				"queue": "content-tagging-queue"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "content-tagging-queue",
+				"max_batch_size": 25,
+				"max_batch_timeout": 15,
+				"max_retries": 5,
+				"dead_letter_queue": "content-tagging-dlq",
+				"retry_delay": 30
+			}
+		]
 	}
 	/**
 	 * Smart Placement

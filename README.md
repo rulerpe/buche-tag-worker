@@ -1,21 +1,72 @@
 # Buche Tag Worker
 
-The Buche Tag Worker is a Cloudflare Worker that automatically discovers and assigns tags to content snippets using AI text analysis and simple text similarity matching, with intelligent tag consolidation.
+The Buche Tag Worker is a Cloudflare Worker that automatically discovers and assigns tags to content snippets using AI text analysis and text similarity matching, with intelligent tag consolidation and **queue-based processing** for production scalability.
 
 ## Features
 
-- **AI Tag Discovery**: Uses AI to analyze content and propose meaningful tags
-- **Smart Tag Merging**: Employs text similarity to merge similar tags during processing
-- **Intelligent Consolidation**: AI-powered post-processing to group semantically similar tags
-- **Limited Tag Set**: Maintains a curated set of 20-30 global tags to prevent tag explosion
-- **Efficient Storage**: Stores relationships in D1 database with proper indexing
-- **Batch Processing**: Can process snippets individually or in batches
-- **Simple & Fast**: No embedding calculations during tagging - uses efficient text similarity
+- **🚀 Queue-Based Processing**: Production-ready scalable processing without timeouts
+- **⚡ Rate Limit Protection**: Built-in rate limiting and retry logic for AI API calls
+- **🔄 Automatic Retry**: Smart error handling with exponential backoff
+- **📊 Real-time Monitoring**: Detailed queue status and progress tracking
+- **🤖 AI Tag Discovery**: Uses AI to analyze content and propose meaningful tags
+- **🔀 Smart Tag Merging**: Employs text similarity to merge similar tags during processing
+- **🧠 Intelligent Consolidation**: AI-powered post-processing to group semantically similar tags
+- **🎯 Limited Tag Set**: Maintains a curated set of 20-30 global tags to prevent tag explosion
+- **💾 Efficient Storage**: Stores relationships in D1 database with proper indexing
+- **📈 Scalable Architecture**: Handles unlimited snippets with Cloudflare Queues
 
 ## API Endpoints
 
-### POST `/tag`
-Start the tagging process for snippets.
+### POST `/tag-queue` (🌟 Recommended)
+Queue all untagged snippets for AI processing using Cloudflare Queues.
+
+**Request Body:** (empty)
+```json
+{}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Queued 1,247 snippets for AI tagging",
+  "queuedSnippets": 1247,
+  "totalUntagged": 1247,
+  "processingNote": "Snippets will be processed asynchronously by queue consumers"
+}
+```
+
+### GET `/queue-status` (🆕 Queue Monitoring)
+Monitor queue processing progress and status.
+
+**Response:**
+```json
+{
+  "database": {
+    "totalSnippets": 5000,
+    "taggedSnippets": 3750,
+    "untaggedSnippets": 1250,
+    "totalTags": 45,
+    "processingProgress": "75.0%"
+  },
+  "queue": {
+    "isConfigured": true,
+    "pendingSnippets": 1250,
+    "processingMode": "queue-based",
+    "consumerSettings": {
+      "maxBatchSize": 25,
+      "maxBatchTimeout": "15 seconds",
+      "maxRetries": 5,
+      "retryDelay": "30 seconds"
+    }
+  },
+  "status": "processing",
+  "timestamp": "2025-01-08T10:30:00.000Z"
+}
+```
+
+### POST `/tag` (Legacy)
+Legacy batch processing mode for testing or small datasets.
 
 **Request Body:**
 ```json
@@ -114,15 +165,22 @@ Initialize the database schema with required tables.
 
 ## Workflow
 
-### 1. Tag Discovery Process (Fast)
+### 1. Queue-Based Tag Processing (Production)
 
-For each snippet, the worker:
+**Queue Processing Flow:**
+1. **Queue All Snippets**: `/tag-queue` endpoint queues all untagged snippets
+2. **Automatic Processing**: Queue consumers process snippets in batches of 25
+3. **Rate Limiting**: Maximum 5 concurrent AI requests with 1-second delays
+4. **Error Handling**: Automatic retry with exponential backoff (30s → 60s → 120s)
+5. **Monitoring**: Real-time progress tracking via `/queue-status`
 
+**For each snippet in the queue:**
 1. **Fetches Content**: Retrieves snippet content from R2 storage
-2. **AI Analysis**: Uses LLaMA 3.1 to analyze content and propose 1-2 descriptive tags
+2. **AI Analysis**: Uses LLaMA 4 Scout to analyze content and propose 5-8 descriptive tags
 3. **Text Similarity Check**: Compares proposed tags against existing tags using text similarity
 4. **Tag Matching**: Uses normalized edit distance (threshold: 0.8) to find similar tags
-5. **Tag Assignment**: Either assigns existing similar tag or creates new one (if under 30-tag limit)
+5. **Tag Assignment**: Either assigns existing similar tag or creates new one (if under 3000-tag limit)
+6. **Acknowledgment**: Message acknowledged on success or retried on failure
 
 ### 2. Tag Consolidation Process (Smart)
 
@@ -210,44 +268,82 @@ Configure in `wrangler.jsonc`:
 }
 ```
 
+### Queue Configuration
+```json
+{
+  "queues": {
+    "consumers": [
+      {
+        "queue": "content-tagging-queue",
+        "max_batch_size": 25,
+        "max_batch_timeout": 15,
+        "max_retries": 5,
+        "dead_letter_queue": "content-tagging-dlq",
+        "retry_delay": 30
+      }
+    ]
+  }
+}
+```
+
 ### Constants
 - `SIMILARITY_THRESHOLD`: 0.8 (text similarity threshold for tag matching)
-- `MAX_TAGS`: 30 (maximum number of global tags)
+- `MAX_TAGS`: 3000 (maximum number of global tags)
+- `CONCURRENT_LIMIT`: 5 (max concurrent AI requests per batch)
+- `BATCH_DELAY`: 1000ms (delay between processing batches)
 
 ## Usage Example
 
-### Complete Workflow
+### Complete Workflow (Queue-Based)
 
 1. **Initialize Schema**:
 ```bash
 curl -X POST https://your-worker.workers.dev/init-schema
 ```
 
-2. **Process All Snippets (Fast)**:
+2. **🚀 Queue All Snippets for Processing**:
 ```bash
-curl -X POST https://your-worker.workers.dev/tag \
-  -H "Content-Type: application/json" \
-  -d '{"batchSize": 20}'
+curl -X POST https://your-worker.workers.dev/tag-queue
 ```
 
-3. **Preview Consolidation Plan**:
+3. **📊 Monitor Processing Progress**:
+```bash
+# Check detailed queue status
+curl https://your-worker.workers.dev/queue-status
+
+# Check general status
+curl https://your-worker.workers.dev/status
+```
+
+4. **Preview Consolidation Plan**:
 ```bash
 curl -X POST https://your-worker.workers.dev/consolidate \
   -H "Content-Type: application/json" \
   -d '{"dryRun": true}'
 ```
 
-4. **Execute Consolidation**:
+5. **Execute Consolidation**:
 ```bash
 curl -X POST https://your-worker.workers.dev/consolidate \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
 
-5. **Check Final Results**:
+6. **Check Final Results**:
 ```bash
 curl https://your-worker.workers.dev/status
 curl https://your-worker.workers.dev/tags
+```
+
+### Legacy Workflow (Batch Processing)
+
+For testing or small datasets, you can still use the legacy batch mode:
+
+```bash
+# Legacy: Process in batches (may timeout on large datasets)
+curl -X POST https://your-worker.workers.dev/tag \
+  -H "Content-Type: application/json" \
+  -d '{"batchSize": 20}'
 ```
 
 ### Example Consolidation
@@ -280,19 +376,55 @@ npm run dev
 npm run deploy
 ```
 
-## Advantages of Two-Phase Approach
+## Advantages of Queue-Based Architecture
 
+### Production Benefits
+- **🚀 No Timeouts**: Queue processing eliminates worker timeout limits
+- **⚡ Automatic Scaling**: Cloudflare automatically scales queue consumers based on backlog
+- **🔄 Built-in Retry**: Automatic retry logic with exponential backoff for failed messages
+- **📊 Real-time Monitoring**: Detailed queue metrics and processing progress
+- **🛡️ Rate Limit Protection**: Built-in rate limiting prevents AI API quota exhaustion
+
+### Two-Phase Processing Benefits
 - **Fast Initial Processing**: Simple text similarity for immediate results
 - **Intelligent Final Cleanup**: AI-powered semantic grouping for quality
 - **Best of Both Worlds**: Speed during tagging + intelligence during consolidation
 - **Cost Effective**: Minimal AI usage during high-volume tagging phase
 - **Reviewable**: Dry-run mode lets you preview consolidations before applying
 
+### Queue vs Legacy Comparison
+| Aspect | Legacy Batch Mode | Queue-Based Processing |
+|--------|-------------------|------------------------|
+| **Timeout Issues** | Yes (worker limits) | No (asynchronous) |
+| **Rate Limiting** | Manual management | Automatic with retry |
+| **Scalability** | Limited by batch size | Unlimited (auto-scaling) |
+| **Error Handling** | Manual retry required | Automatic retry with backoff |
+| **Monitoring** | Basic progress tracking | Detailed queue metrics |
+| **Production Ready** | No (timeouts on large datasets) | Yes (any dataset size) |
+
 ## Error Handling
 
 The worker includes comprehensive error handling:
+
+### Queue-Based Error Handling
+- **Rate Limit Errors**: Automatic retry with 60-second delay for `429` errors
+- **Temporary Errors**: Standard retry for network timeouts and `503` errors
+- **Permanent Errors**: Skip processing for `not found` errors to avoid infinite loops
+- **Dead Letter Queue**: Failed messages after max retries go to DLQ for analysis
+- **Explicit Acknowledgment**: Messages only acknowledged after successful processing
+
+### General Error Handling
 - Individual snippet processing errors are logged but don't stop batch processing
 - AI model failures are gracefully handled with fallback behavior
 - Database constraints prevent duplicate tags and maintain referential integrity
 - Consolidation failures don't corrupt existing data
-- Detailed error reporting in response statistics 
+- Detailed error reporting in response statistics and queue metrics
+
+### Monitoring Failed Processing
+```bash
+# Check queue status for error information
+curl https://your-worker.workers.dev/queue-status
+
+# Messages that fail max retries will be in the dead letter queue
+# Check Cloudflare dashboard for DLQ messages
+``` 

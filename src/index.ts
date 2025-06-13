@@ -12,6 +12,7 @@ export interface Env {
 	CONTENT_BUCKET: R2Bucket;
 	CONTENT_DB: D1Database;
 	AI: Ai;
+	TAGGING_QUEUE?: Queue<QueueMessage>;
 }
 
 interface Tag {
@@ -46,9 +47,15 @@ interface TaggingStats {
 	lastProcessedId?: string; // Track the last processed snippet ID
 }
 
+interface QueueMessage {
+	snippetId: string;
+	timestamp: number;
+	priority?: 'high' | 'medium' | 'low';
+}
+
 const SIMILARITY_THRESHOLD = 0.8; // Text similarity threshold
 const MAX_TAGS = 3000;
-const TAG_PROMPT = `分析这段情色内容片段，建议5-8个简短的中文标签（2-4个字），用来描述其主要主题和场景。重点关注：
+const TAG_PROMPT = `分析这段情色内容片段，建议5-8个简短的中文标签（2个字），用来描述其主要主题和场景。重点关注：
 
 **性爱玩法/活动：**
 - 具体性行为（口交、肛交、69等）
@@ -83,6 +90,10 @@ export default {
 			return handleTagging(request, env);
 		}
 		
+		if (url.pathname === '/tag-queue') {
+			return handleQueueTagging(request, env);
+		}
+		
 		if (url.pathname === '/status') {
 			return handleStatus(env);
 		}
@@ -103,8 +114,16 @@ export default {
 			return handleClearTags(request, env);
 		}
 		
-		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process\n- GET /status - Check tagging status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
+		if (url.pathname === '/queue-status') {
+			return handleQueueStatus(request, env);
+		}
+		
+		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue all untagged snippets for AI processing\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
 	},
+
+	async queue(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
+		return handleQueueBatch(batch, env, ctx);
+	}
 } satisfies ExportedHandler<Env>;
 
 async function handleTagging(request: Request, env: Env): Promise<Response> {
@@ -604,9 +623,9 @@ async function generateConsolidationPlan(tags: Tag[], ai: Ai): Promise<Consolida
 ${tagList}
 
 指示：
-1. 将意思基本相同的标签分组（例如："浪漫邂逅"和"亲密时刻"）
+1. 将意思基本相同的标签分组
 2. 对于每组，选择**最合适、最准确、最简洁**的标签名称作为主标签
-3. 如果现有标签都不够好，可以建议一个更好的标签名称（2-4个中文字符）
+3. 如果现有标签都不够好，可以建议一个更好的标签名称（2个中文字符）
 4. 只将真正相似的标签分组 - 不要强制分组
 5. 每组最多合并10个标签，优先合并最相似的
 6. 为每个分组提供简短的理由（不超过15个字）
@@ -954,4 +973,216 @@ async function handleClearTags(request: Request, env: Env): Promise<Response> {
 			headers: { 'Content-Type': 'application/json' }
 		});
 	}
+}
+
+async function handleQueueStatus(request: Request, env: Env): Promise<Response> {
+	if (request.method !== 'GET') {
+		return new Response('Method not allowed', { status: 405 });
+	}
+	
+	try {
+		// Get queue statistics and database status
+		const [snippetsResult, tagsResult, taggedResult, untaggedResult] = await Promise.all([
+			env.CONTENT_DB.prepare('SELECT COUNT(*) as count FROM snippets').first(),
+			env.CONTENT_DB.prepare('SELECT COUNT(*) as count FROM tags').first(),
+			env.CONTENT_DB.prepare('SELECT COUNT(*) as count FROM snippets WHERE tags IS NOT NULL AND tags != "[]"').first(),
+			env.CONTENT_DB.prepare('SELECT COUNT(*) as count FROM snippets WHERE (tags IS NULL OR tags = "[]")').first()
+		]);
+		
+		const totalSnippets = (snippetsResult?.count as number) || 0;
+		const totalTags = (tagsResult?.count as number) || 0;
+		const taggedSnippets = (taggedResult?.count as number) || 0;
+		const untaggedSnippets = (untaggedResult?.count as number) || 0;
+		
+		// Calculate processing progress
+		const processingProgress = totalSnippets > 0 ? (taggedSnippets / totalSnippets * 100).toFixed(1) : '0.0';
+		
+		const response = {
+			database: {
+				totalSnippets,
+				taggedSnippets,
+				untaggedSnippets,
+				totalTags,
+				processingProgress: `${processingProgress}%`
+			},
+			queue: {
+				isConfigured: !!env.TAGGING_QUEUE,
+				pendingSnippets: untaggedSnippets,
+				processingMode: 'queue-based',
+				consumerSettings: {
+					maxBatchSize: 25,
+					maxBatchTimeout: '15 seconds',
+					maxRetries: 5,
+					retryDelay: '30 seconds'
+				}
+			},
+			status: untaggedSnippets > 0 ? 'processing' : 'idle',
+			timestamp: new Date().toISOString()
+		};
+		
+		return new Response(JSON.stringify(response, null, 2), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+		
+	} catch (error) {
+		console.error('Queue status error:', error);
+		return new Response(JSON.stringify({
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		}), {
+			status: 500,
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+}
+
+async function handleQueueTagging(request: Request, env: Env): Promise<Response> {
+	if (request.method !== 'POST') {
+		return new Response('Method not allowed', { status: 405 });
+	}
+	
+	try {
+		await initializeDatabase(env.CONTENT_DB);
+		
+		if (!env.TAGGING_QUEUE) {
+			return new Response(JSON.stringify({
+				success: false,
+				error: 'Queue not configured. Make sure TAGGING_QUEUE binding is set up.'
+			}), {
+				status: 500,
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+		
+		// Get all untagged snippets
+		const untaggedSnippets = await env.CONTENT_DB.prepare(
+			'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id'
+		).all();
+		
+		const snippetIds = untaggedSnippets.results as unknown as { id: string }[];
+		
+		if (snippetIds.length === 0) {
+			return new Response(JSON.stringify({
+				success: true,
+				message: 'No untagged snippets found',
+				queuedSnippets: 0
+			}), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+		
+		// Queue all untagged snippets for processing
+		let queuedCount = 0;
+		const timestamp = Date.now();
+		
+		for (const snippet of snippetIds) {
+			try {
+				await env.TAGGING_QUEUE.send({
+					snippetId: snippet.id,
+					timestamp: timestamp,
+					priority: 'medium'
+				});
+				queuedCount++;
+			} catch (error) {
+				console.error(`Failed to queue snippet ${snippet.id}:`, error);
+			}
+		}
+		
+		return new Response(JSON.stringify({
+			success: true,
+			message: `Queued ${queuedCount} snippets for AI tagging`,
+			queuedSnippets: queuedCount,
+			totalUntagged: snippetIds.length,
+			processingNote: 'Snippets will be processed asynchronously by queue consumers'
+		}), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+		
+	} catch (error) {
+		console.error('Queue tagging error:', error);
+		return new Response(JSON.stringify({
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		}), {
+			status: 500,
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+}
+
+async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
+	console.log(`Processing queue batch of ${batch.messages.length} messages`);
+	
+	await initializeDatabase(env.CONTENT_DB);
+	
+	// Process messages with rate limiting (max 5 concurrent AI requests)
+	const CONCURRENT_LIMIT = 5;
+	const chunks = chunkArray([...batch.messages], CONCURRENT_LIMIT);
+	
+	for (const chunk of chunks) {
+		await Promise.all(chunk.map(async (message) => {
+			try {
+				const messageData = message.body as QueueMessage;
+				console.log(`Processing snippet: ${messageData.snippetId}`);
+				
+				// Process the snippet with AI tagging
+				const stats: TaggingStats = {
+					processedSnippets: 0,
+					newTagsCreated: 0,
+					existingTagsUsed: 0,
+					totalTags: 0,
+					errors: []
+				};
+				
+				await processSnippet(messageData.snippetId, env, stats);
+				
+				// Acknowledge successful processing
+				message.ack();
+				console.log(`Successfully processed snippet: ${messageData.snippetId}`);
+				
+			} catch (error) {
+				console.error(`Failed to process message ${message.id}:`, error);
+				
+				// Handle different types of errors
+				if (error instanceof Error) {
+					if (error.message.includes('Too many API requests') || 
+					    error.message.includes('rate limit') ||
+					    error.message.includes('429')) {
+						// Rate limit error - retry with delay
+						console.log(`Rate limit hit for snippet ${(message.body as QueueMessage).snippetId}, retrying with delay`);
+						message.retry({ delaySeconds: 60 });
+					} else if (error.message.includes('timeout') || 
+							   error.message.includes('network') ||
+							   error.message.includes('503')) {
+						// Temporary error - standard retry
+						console.log(`Temporary error for snippet ${(message.body as QueueMessage).snippetId}, retrying`);
+						message.retry();
+					} else if (error.message.includes('not found')) {
+						// Snippet not found - skip this message
+						console.log(`Snippet ${(message.body as QueueMessage).snippetId} not found, skipping`);
+						message.ack();
+					} else {
+						// Other errors - retry with standard delay
+						message.retry();
+					}
+				} else {
+					// Unknown error - retry
+					message.retry();
+				}
+			}
+		}));
+		
+		// Add small delay between chunks to prevent overwhelming the AI API
+		if (chunks.indexOf(chunk) < chunks.length - 1) {
+			await new Promise(resolve => setTimeout(resolve, 1000));
+		}
+	}
+}
+
+function chunkArray<T>(array: T[], size: number): T[][] {
+	const chunks: T[][] = [];
+	for (let i = 0; i < array.length; i += size) {
+		chunks.push(array.slice(i, i + size));
+	}
+	return chunks;
 }
