@@ -12,7 +12,7 @@ export interface Env {
 	CONTENT_BUCKET: R2Bucket;
 	CONTENT_DB: D1Database;
 	AI: Ai;
-	TAGGING_QUEUE?: Queue<QueueMessage>;
+	TAGGING_QUEUE: Queue<QueueMessage>;
 }
 
 interface Tag {
@@ -118,7 +118,7 @@ export default {
 			return handleQueueStatus(request, env);
 		}
 		
-		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue all untagged snippets for AI processing\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
+		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue untagged snippets for AI processing (batch: 100 default)\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
 	},
 
 	async queue(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -1053,11 +1053,14 @@ async function handleQueueTagging(request: Request, env: Env): Promise<Response>
 				headers: { 'Content-Type': 'application/json' }
 			});
 		}
+
+		const body = await request.json().catch(() => ({})) as { batchSize?: number };
+		const batchSize = body.batchSize || 100; // Default to 100 snippets per batch
 		
-		// Get all untagged snippets
+		// Get limited batch of untagged snippets
 		const untaggedSnippets = await env.CONTENT_DB.prepare(
-			'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id'
-		).all();
+			'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id LIMIT ?'
+		).bind(batchSize).all();
 		
 		const snippetIds = untaggedSnippets.results as unknown as { id: string }[];
 		
@@ -1071,29 +1074,67 @@ async function handleQueueTagging(request: Request, env: Env): Promise<Response>
 			});
 		}
 		
-		// Queue all untagged snippets for processing
+		// Queue snippets in smaller batches with rate limiting
 		let queuedCount = 0;
+		let failedCount = 0;
 		const timestamp = Date.now();
+		const QUEUE_BATCH_SIZE = 25; // Queue 25 at a time to avoid API limits
 		
-		for (const snippet of snippetIds) {
-			try {
-				await env.TAGGING_QUEUE.send({
-					snippetId: snippet.id,
-					timestamp: timestamp,
-					priority: 'medium'
-				});
-				queuedCount++;
-			} catch (error) {
-				console.error(`Failed to queue snippet ${snippet.id}:`, error);
+		// Process in chunks to avoid hitting API limits
+		const chunks = chunkArray(snippetIds, QUEUE_BATCH_SIZE);
+		
+		for (let i = 0; i < chunks.length; i++) {
+			const chunk = chunks[i];
+			
+			// Queue all snippets in this chunk
+			const queuePromises = chunk.map(async (snippet) => {
+				try {
+					await env.TAGGING_QUEUE.send({
+						snippetId: snippet.id,
+						timestamp: timestamp,
+						priority: 'medium'
+					});
+					return { success: true, id: snippet.id };
+				} catch (error) {
+					console.error(`Failed to queue snippet ${snippet.id}:`, error);
+					return { success: false, id: snippet.id, error };
+				}
+			});
+			
+			// Wait for this chunk to complete
+			const results = await Promise.all(queuePromises);
+			
+			// Count successes and failures
+			for (const result of results) {
+				if (result.success) {
+					queuedCount++;
+				} else {
+					failedCount++;
+				}
+			}
+			
+			// Add delay between chunks to respect rate limits (except for last chunk)
+			if (i < chunks.length - 1) {
+				await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay
 			}
 		}
+		
+		// Get total remaining untagged count for next batch info
+		const remainingUntagged = await env.CONTENT_DB.prepare(
+			'SELECT COUNT(*) as count FROM snippets WHERE (tags IS NULL OR tags = "[]")'
+		).first();
+		
+		const totalRemaining = ((remainingUntagged?.count as number) || 0) - queuedCount;
 		
 		return new Response(JSON.stringify({
 			success: true,
 			message: `Queued ${queuedCount} snippets for AI tagging`,
 			queuedSnippets: queuedCount,
-			totalUntagged: snippetIds.length,
-			processingNote: 'Snippets will be processed asynchronously by queue consumers'
+			failedSnippets: failedCount,
+			batchSize: snippetIds.length,
+			remainingUntagged: totalRemaining,
+			processingNote: 'Snippets will be processed asynchronously by queue consumers',
+			nextBatchRecommendation: totalRemaining > 0 ? `Call this endpoint again to queue ${Math.min(totalRemaining, batchSize)} more snippets` : null
 		}), {
 			headers: { 'Content-Type': 'application/json' }
 		});
