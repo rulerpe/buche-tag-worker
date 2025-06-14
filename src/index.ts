@@ -55,7 +55,7 @@ interface QueueMessage {
 
 const SIMILARITY_THRESHOLD = 0.8; // Text similarity threshold
 const MAX_TAGS = 3000;
-const TAG_PROMPT = `分析这段情色内容片段，建议5-8个简短的中文标签（2个字），用来描述其主要主题和场景。重点关注：
+const TAG_PROMPT = `分析这段情色内容片段，至少为一下每个方面各生成标签，每个标签2个字：
 
 **性爱玩法/活动：**
 - 具体性行为（口交、肛交、69等）
@@ -118,7 +118,7 @@ export default {
 			return handleQueueStatus(request, env);
 		}
 		
-		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue untagged snippets for AI processing (batch: 100 default)\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
+		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue ALL untagged snippets for AI processing\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
 	},
 
 	async queue(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -1054,13 +1054,10 @@ async function handleQueueTagging(request: Request, env: Env): Promise<Response>
 			});
 		}
 
-		const body = await request.json().catch(() => ({})) as { batchSize?: number };
-		const batchSize = body.batchSize || 100; // Default to 100 snippets per batch
-		
-		// Get limited batch of untagged snippets
+		// Get ALL untagged snippets (no limit)
 		const untaggedSnippets = await env.CONTENT_DB.prepare(
-			'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id LIMIT ?'
-		).bind(batchSize).all();
+			'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id'
+		).all();
 		
 		const snippetIds = untaggedSnippets.results as unknown as { id: string }[];
 		
@@ -1074,17 +1071,20 @@ async function handleQueueTagging(request: Request, env: Env): Promise<Response>
 			});
 		}
 		
-		// Queue snippets in smaller batches with rate limiting
+		// Queue ALL snippets in smaller batches with rate limiting
 		let queuedCount = 0;
 		let failedCount = 0;
 		const timestamp = Date.now();
-		const QUEUE_BATCH_SIZE = 25; // Queue 25 at a time to avoid API limits
+		const QUEUE_BATCH_SIZE = 10; // Reduced to 10 at a time to avoid API limits
 		
-		// Process in chunks to avoid hitting API limits
+		console.log(`Starting to queue ${snippetIds.length} untagged snippets`);
+		
+		// Process ALL snippets in chunks to avoid hitting API limits
 		const chunks = chunkArray(snippetIds, QUEUE_BATCH_SIZE);
 		
 		for (let i = 0; i < chunks.length; i++) {
 			const chunk = chunks[i];
+			console.log(`Processing chunk ${i + 1}/${chunks.length} (${chunk.length} snippets)`);
 			
 			// Queue all snippets in this chunk
 			const queuePromises = chunk.map(async (snippet) => {
@@ -1115,26 +1115,20 @@ async function handleQueueTagging(request: Request, env: Env): Promise<Response>
 			
 			// Add delay between chunks to respect rate limits (except for last chunk)
 			if (i < chunks.length - 1) {
-				await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay
+				await new Promise(resolve => setTimeout(resolve, 200)); // Increased to 200ms delay
 			}
 		}
 		
-		// Get total remaining untagged count for next batch info
-		const remainingUntagged = await env.CONTENT_DB.prepare(
-			'SELECT COUNT(*) as count FROM snippets WHERE (tags IS NULL OR tags = "[]")'
-		).first();
-		
-		const totalRemaining = ((remainingUntagged?.count as number) || 0) - queuedCount;
+		console.log(`Completed queuing: ${queuedCount} successful, ${failedCount} failed`);
 		
 		return new Response(JSON.stringify({
 			success: true,
-			message: `Queued ${queuedCount} snippets for AI tagging`,
+			message: `Queued ${queuedCount} of ${snippetIds.length} untagged snippets for AI tagging`,
+			totalSnippets: snippetIds.length,
 			queuedSnippets: queuedCount,
 			failedSnippets: failedCount,
-			batchSize: snippetIds.length,
-			remainingUntagged: totalRemaining,
-			processingNote: 'Snippets will be processed asynchronously by queue consumers',
-			nextBatchRecommendation: totalRemaining > 0 ? `Call this endpoint again to queue ${Math.min(totalRemaining, batchSize)} more snippets` : null
+			chunksProcessed: chunks.length,
+			processingNote: 'All untagged snippets have been queued and will be processed asynchronously by queue consumers'
 		}), {
 			headers: { 'Content-Type': 'application/json' }
 		});
