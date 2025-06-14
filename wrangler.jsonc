@@ -43,6 +43,15 @@
 				"retry_delay": 30
 			}
 		]
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "QUEUE_MANAGER",
+				"class_name": "QueueManager",
+				"script_name": "buche-tag-worker"
+			}
+		]
 	}
 	/**
 	 * Smart Placement

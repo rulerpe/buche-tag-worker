@@ -13,6 +13,7 @@ export interface Env {
 	CONTENT_DB: D1Database;
 	AI: Ai;
 	TAGGING_QUEUE: Queue<QueueMessage>;
+	QUEUE_MANAGER: DurableObjectNamespace;
 }
 
 interface Tag {
@@ -51,6 +52,17 @@ interface QueueMessage {
 	snippetId: string;
 	timestamp: number;
 	priority?: 'high' | 'medium' | 'low';
+}
+
+interface QueueProgress {
+	total: number;
+	queued: number;
+	failed: number;
+	status: 'idle' | 'processing' | 'completed' | 'error';
+	startedAt?: string;
+	completedAt?: string;
+	lastProcessedId?: string;
+	errorMessage?: string;
 }
 
 const SIMILARITY_THRESHOLD = 0.8; // Text similarity threshold
@@ -118,7 +130,15 @@ export default {
 			return handleQueueStatus(request, env);
 		}
 		
-		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue ALL untagged snippets for AI processing\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
+		if (url.pathname === '/tag-queue/progress') {
+			return handleQueueProgress(request, env);
+		}
+		
+		if (url.pathname === '/tag-queue/stop') {
+			return handleQueueStop(request, env);
+		}
+		
+		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue ALL untagged snippets for AI processing via Durable Object\n- GET /tag-queue/progress - Get queue progress from Durable Object\n- POST /tag-queue/stop - Stop queue processing\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
 	},
 
 	async queue(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -1042,99 +1062,77 @@ async function handleQueueTagging(request: Request, env: Env): Promise<Response>
 	}
 	
 	try {
-		await initializeDatabase(env.CONTENT_DB);
+		// Get the QueueManager Durable Object
+		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
+		const doStub = env.QUEUE_MANAGER.get(doId);
 		
-		if (!env.TAGGING_QUEUE) {
-			return new Response(JSON.stringify({
-				success: false,
-				error: 'Queue not configured. Make sure TAGGING_QUEUE binding is set up.'
-			}), {
-				status: 500,
-				headers: { 'Content-Type': 'application/json' }
-			});
-		}
-
-		// Get ALL untagged snippets (no limit)
-		const untaggedSnippets = await env.CONTENT_DB.prepare(
-			'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id'
-		).all();
+		// Start queuing via Durable Object
+		const response = await doStub.fetch(new Request('https://do/start-queuing', {
+			method: 'POST'
+		}));
 		
-		const snippetIds = untaggedSnippets.results as unknown as { id: string }[];
-		
-		if (snippetIds.length === 0) {
-			return new Response(JSON.stringify({
-				success: true,
-				message: 'No untagged snippets found',
-				queuedSnippets: 0
-			}), {
-				headers: { 'Content-Type': 'application/json' }
-			});
-		}
-		
-		// Queue ALL snippets in smaller batches with rate limiting
-		let queuedCount = 0;
-		let failedCount = 0;
-		const timestamp = Date.now();
-		const QUEUE_BATCH_SIZE = 10; // Reduced to 10 at a time to avoid API limits
-		
-		console.log(`Starting to queue ${snippetIds.length} untagged snippets`);
-		
-		// Process ALL snippets in chunks to avoid hitting API limits
-		const chunks = chunkArray(snippetIds, QUEUE_BATCH_SIZE);
-		
-		for (let i = 0; i < chunks.length; i++) {
-			const chunk = chunks[i];
-			console.log(`Processing chunk ${i + 1}/${chunks.length} (${chunk.length} snippets)`);
-			
-			// Queue all snippets in this chunk
-			const queuePromises = chunk.map(async (snippet) => {
-				try {
-					await env.TAGGING_QUEUE.send({
-						snippetId: snippet.id,
-						timestamp: timestamp,
-						priority: 'medium'
-					});
-					return { success: true, id: snippet.id };
-				} catch (error) {
-					console.error(`Failed to queue snippet ${snippet.id}:`, error);
-					return { success: false, id: snippet.id, error };
-				}
-			});
-			
-			// Wait for this chunk to complete
-			const results = await Promise.all(queuePromises);
-			
-			// Count successes and failures
-			for (const result of results) {
-				if (result.success) {
-					queuedCount++;
-				} else {
-					failedCount++;
-				}
-			}
-			
-			// Add delay between chunks to respect rate limits (except for last chunk)
-			if (i < chunks.length - 1) {
-				await new Promise(resolve => setTimeout(resolve, 200)); // Increased to 200ms delay
-			}
-		}
-		
-		console.log(`Completed queuing: ${queuedCount} successful, ${failedCount} failed`);
-		
-		return new Response(JSON.stringify({
-			success: true,
-			message: `Queued ${queuedCount} of ${snippetIds.length} untagged snippets for AI tagging`,
-			totalSnippets: snippetIds.length,
-			queuedSnippets: queuedCount,
-			failedSnippets: failedCount,
-			chunksProcessed: chunks.length,
-			processingNote: 'All untagged snippets have been queued and will be processed asynchronously by queue consumers'
-		}), {
-			headers: { 'Content-Type': 'application/json' }
-		});
+		return response;
 		
 	} catch (error) {
 		console.error('Queue tagging error:', error);
+		return new Response(JSON.stringify({
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		}), {
+			status: 500,
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+}
+
+async function handleQueueProgress(request: Request, env: Env): Promise<Response> {
+	if (request.method !== 'GET') {
+		return new Response('Method not allowed', { status: 405 });
+	}
+	
+	try {
+		// Get the QueueManager Durable Object
+		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
+		const doStub = env.QUEUE_MANAGER.get(doId);
+		
+		// Get progress from Durable Object
+		const response = await doStub.fetch(new Request('https://do/progress', {
+			method: 'GET'
+		}));
+		
+		return response;
+		
+	} catch (error) {
+		console.error('Queue progress error:', error);
+		return new Response(JSON.stringify({
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		}), {
+			status: 500,
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+}
+
+async function handleQueueStop(request: Request, env: Env): Promise<Response> {
+	if (request.method !== 'POST') {
+		return new Response('Method not allowed', { status: 405 });
+	}
+	
+	try {
+		// Get the QueueManager Durable Object
+		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
+		const doStub = env.QUEUE_MANAGER.get(doId);
+		
+		// Send stop signal to Durable Object
+		const response = await doStub.fetch(new Request('https://do/stop', {
+			method: 'POST'
+		}));
+		
+		return response;
+		
+	} catch (error) {
+		console.error('Queue stop error:', error);
 		return new Response(JSON.stringify({
 			success: false,
 			error: error instanceof Error ? error.message : String(error)
@@ -1220,4 +1218,185 @@ function chunkArray<T>(array: T[], size: number): T[][] {
 		chunks.push(array.slice(i, i + size));
 	}
 	return chunks;
+}
+
+// Durable Object for managing queue operations
+export class QueueManager {
+	private state: DurableObjectState;
+	private env: Env;
+
+	constructor(state: DurableObjectState, env: Env) {
+		this.state = state;
+		this.env = env;
+	}
+
+	async fetch(request: Request): Promise<Response> {
+		const url = new URL(request.url);
+
+		if (url.pathname === '/start-queuing') {
+			return this.handleStartQueuing();
+		}
+
+		if (url.pathname === '/progress') {
+			return this.handleGetProgress();
+		}
+
+		if (url.pathname === '/stop') {
+			return this.handleStop();
+		}
+
+		return new Response('QueueManager DO\nEndpoints:\n- /start-queuing - Start queuing all untagged snippets\n- /progress - Get current progress\n- /stop - Stop current operation');
+	}
+
+	private async handleStartQueuing(): Promise<Response> {
+		const currentProgress = await this.state.storage.get<QueueProgress>('progress');
+		
+		if (currentProgress && currentProgress.status === 'processing') {
+			return new Response(JSON.stringify({
+				success: false,
+				message: 'Queue processing already in progress',
+				progress: currentProgress
+			}), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		}
+
+		// Start the background processing
+		this.startBackgroundQueuing();
+
+		return new Response(JSON.stringify({
+			success: true,
+			message: 'Started queuing all untagged snippets in background',
+			note: 'Use /progress endpoint to check status'
+		}), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+
+	private async handleGetProgress(): Promise<Response> {
+		const progress = await this.state.storage.get<QueueProgress>('progress') || {
+			total: 0,
+			queued: 0,
+			failed: 0,
+			status: 'idle'
+		};
+
+		return new Response(JSON.stringify(progress), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+
+	private async handleStop(): Promise<Response> {
+		await this.state.storage.put('shouldStop', true);
+		
+		return new Response(JSON.stringify({
+			success: true,
+			message: 'Stop signal sent. Processing will halt after current batch.'
+		}), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+
+	private async startBackgroundQueuing(): Promise<void> {
+		try {
+			await initializeDatabase(this.env.CONTENT_DB);
+
+			if (!this.env.TAGGING_QUEUE) {
+				throw new Error('TAGGING_QUEUE not configured');
+			}
+
+			// Initialize progress
+			const progress: QueueProgress = {
+				total: 0,
+				queued: 0,
+				failed: 0,
+				status: 'processing',
+				startedAt: new Date().toISOString()
+			};
+
+			// Get all untagged snippets
+			const untaggedSnippets = await this.env.CONTENT_DB.prepare(
+				'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id'
+			).all();
+
+			const snippetIds = untaggedSnippets.results as unknown as { id: string }[];
+			progress.total = snippetIds.length;
+
+			await this.state.storage.put('progress', progress);
+			await this.state.storage.put('shouldStop', false);
+
+			if (snippetIds.length === 0) {
+				progress.status = 'completed';
+				progress.completedAt = new Date().toISOString();
+				await this.state.storage.put('progress', progress);
+				return;
+			}
+
+			console.log(`QueueManager: Starting to queue ${snippetIds.length} untagged snippets`);
+
+			// Process in small batches with delays
+			const BATCH_SIZE = 10;
+			const DELAY_MS = 300;
+			const timestamp = Date.now();
+
+			for (let i = 0; i < snippetIds.length; i += BATCH_SIZE) {
+				// Check if we should stop
+				const shouldStop = await this.state.storage.get<boolean>('shouldStop');
+				if (shouldStop) {
+					progress.status = 'idle';
+					progress.errorMessage = 'Stopped by user request';
+					await this.state.storage.put('progress', progress);
+					return;
+				}
+
+				const batch = snippetIds.slice(i, i + BATCH_SIZE);
+				console.log(`QueueManager: Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(snippetIds.length / BATCH_SIZE)} (${batch.length} snippets)`);
+
+				// Queue each snippet in this batch
+				for (const snippet of batch) {
+					try {
+						await this.env.TAGGING_QUEUE.send({
+							snippetId: snippet.id,
+							timestamp: timestamp,
+							priority: 'medium'
+						});
+						progress.queued++;
+						progress.lastProcessedId = snippet.id;
+					} catch (error) {
+						console.error(`QueueManager: Failed to queue snippet ${snippet.id}:`, error);
+						progress.failed++;
+					}
+				}
+
+				// Update progress
+				await this.state.storage.put('progress', progress);
+
+				// Add delay between batches (except for last batch)
+				if (i + BATCH_SIZE < snippetIds.length) {
+					await new Promise(resolve => setTimeout(resolve, DELAY_MS));
+				}
+			}
+
+			// Mark as completed
+			progress.status = 'completed';
+			progress.completedAt = new Date().toISOString();
+			await this.state.storage.put('progress', progress);
+
+			console.log(`QueueManager: Completed queuing. Success: ${progress.queued}, Failed: ${progress.failed}`);
+
+		} catch (error) {
+			console.error('QueueManager: Error during background queuing:', error);
+			
+			const progress: QueueProgress = {
+				total: 0,
+				queued: 0,
+				failed: 0,
+				status: 'error',
+				startedAt: new Date().toISOString(),
+				errorMessage: error instanceof Error ? error.message : String(error)
+			};
+			
+			await this.state.storage.put('progress', progress);
+		}
+	}
 }
