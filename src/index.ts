@@ -1221,18 +1221,17 @@ function chunkArray<T>(array: T[], size: number): T[][] {
 }
 
 // Durable Object for managing queue operations
-export class QueueManager {
-	private state: DurableObjectState;
+export class QueueManager extends DurableObject {
 	private env: Env;
 
 	constructor(state: DurableObjectState, env: Env) {
-		this.state = state;
+		super(state, env);
 		this.env = env;
 	}
 
 	// RPC Methods (recommended approach)
 	async startQueuing(): Promise<{ success: boolean; message: string; note?: string; progress?: QueueProgress }> {
-		const currentProgress = await this.state.storage.get<QueueProgress>('progress');
+		const currentProgress = await this.ctx.storage.get<QueueProgress>('progress');
 		
 		if (currentProgress && currentProgress.status === 'processing') {
 			return {
@@ -1253,7 +1252,7 @@ export class QueueManager {
 	}
 
 	async getProgress(): Promise<QueueProgress> {
-		return await this.state.storage.get<QueueProgress>('progress') || {
+		return await this.ctx.storage.get<QueueProgress>('progress') || {
 			total: 0,
 			queued: 0,
 			failed: 0,
@@ -1262,7 +1261,7 @@ export class QueueManager {
 	}
 
 	async stop(): Promise<{ success: boolean; message: string }> {
-		await this.state.storage.put('shouldStop', true);
+		await this.ctx.storage.put('shouldStop', true);
 		
 		return {
 			success: true,
@@ -1301,13 +1300,13 @@ export class QueueManager {
 			const snippetIds = untaggedSnippets.results as unknown as { id: string }[];
 			progress.total = snippetIds.length;
 
-			await this.state.storage.put('progress', progress);
-			await this.state.storage.put('shouldStop', false);
+			await this.ctx.storage.put('progress', progress);
+			await this.ctx.storage.put('shouldStop', false);
 
 			if (snippetIds.length === 0) {
 				progress.status = 'completed';
 				progress.completedAt = new Date().toISOString();
-				await this.state.storage.put('progress', progress);
+				await this.ctx.storage.put('progress', progress);
 				return;
 			}
 
@@ -1320,11 +1319,11 @@ export class QueueManager {
 
 			for (let i = 0; i < snippetIds.length; i += BATCH_SIZE) {
 				// Check if we should stop
-				const shouldStop = await this.state.storage.get<boolean>('shouldStop');
+				const shouldStop = await this.ctx.storage.get<boolean>('shouldStop');
 				if (shouldStop) {
 					progress.status = 'idle';
 					progress.errorMessage = 'Stopped by user request';
-					await this.state.storage.put('progress', progress);
+					await this.ctx.storage.put('progress', progress);
 					return;
 				}
 
@@ -1348,7 +1347,7 @@ export class QueueManager {
 				}
 
 				// Update progress
-				await this.state.storage.put('progress', progress);
+				await this.ctx.storage.put('progress', progress);
 
 				// Add delay between batches (except for last batch)
 				if (i + BATCH_SIZE < snippetIds.length) {
@@ -1359,7 +1358,7 @@ export class QueueManager {
 			// Mark as completed
 			progress.status = 'completed';
 			progress.completedAt = new Date().toISOString();
-			await this.state.storage.put('progress', progress);
+			await this.ctx.storage.put('progress', progress);
 
 			console.log(`QueueManager: Completed queuing. Success: ${progress.queued}, Failed: ${progress.failed}`);
 
@@ -1375,7 +1374,7 @@ export class QueueManager {
 				errorMessage: error instanceof Error ? error.message : String(error)
 			};
 			
-			await this.state.storage.put('progress', progress);
+			await this.ctx.storage.put('progress', progress);
 		}
 	}
 }
