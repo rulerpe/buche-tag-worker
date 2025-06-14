@@ -7,13 +7,14 @@
  * - Limits global tag set to 20-30 tags
  * - Stores tag relationships in D1 database
  */
+import { DurableObject } from "cloudflare:workers";
 
 export interface Env {
 	CONTENT_BUCKET: R2Bucket;
 	CONTENT_DB: D1Database;
 	AI: Ai;
 	TAGGING_QUEUE: Queue<QueueMessage>;
-	QUEUE_MANAGER: DurableObjectNamespace;
+	QUEUE_MANAGER: DurableObjectNamespace<QueueManager>;
 }
 
 interface Tag {
@@ -1222,7 +1223,7 @@ function chunkArray<T>(array: T[], size: number): T[][] {
 
 // Durable Object for managing queue operations
 export class QueueManager extends DurableObject {
-	private env: Env;
+	env: Env;
 
 	constructor(state: DurableObjectState, env: Env) {
 		super(state, env);
