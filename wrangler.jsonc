@@ -48,8 +48,7 @@
 		"bindings": [
 			{
 				"name": "QUEUE_MANAGER",
-				"class_name": "QueueManager",
-				"script_name": "buche-tag-worker"
+				"class_name": "QueueManager"
 			}
 		]
 	}
