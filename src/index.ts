@@ -139,7 +139,11 @@ export default {
 			return handleQueueStop(request, env);
 		}
 		
-		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue ALL untagged snippets for AI processing via Durable Object\n- GET /tag-queue/progress - Get queue progress from Durable Object\n- POST /tag-queue/stop - Stop queue processing\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
+		if (url.pathname === '/tag-queue/retry') {
+			return handleQueueRetry(request, env);
+		}
+		
+		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue ALL untagged snippets for AI processing via Durable Object\n- GET /tag-queue/progress - Get queue progress from Durable Object\n- POST /tag-queue/stop - Stop queue processing\n- POST /tag-queue/retry - Retry queuing remaining untagged snippets\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
 	},
 
 	async queue(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -1018,6 +1022,16 @@ async function handleQueueStatus(request: Request, env: Env): Promise<Response> 
 		// Calculate processing progress
 		const processingProgress = totalSnippets > 0 ? (taggedSnippets / totalSnippets * 100).toFixed(1) : '0.0';
 		
+		// Get Durable Object progress
+		let doProgress = null;
+		try {
+			const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
+			const doStub = env.QUEUE_MANAGER.get(doId);
+			doProgress = await doStub.getProgress();
+		} catch (error) {
+			console.error('Error getting DO progress:', error);
+		}
+		
 		const response = {
 			database: {
 				totalSnippets,
@@ -1037,7 +1051,13 @@ async function handleQueueStatus(request: Request, env: Env): Promise<Response> 
 					retryDelay: '30 seconds'
 				}
 			},
+			durableObject: doProgress,
 			status: untaggedSnippets > 0 ? 'processing' : 'idle',
+			recommendations: untaggedSnippets > 0 ? [
+				'Run POST /tag-queue/retry to retry queuing remaining snippets',
+				'Check dead letter queue in Cloudflare dashboard for failed messages',
+				'Verify queue consumers are processing messages'
+			] : [],
 			timestamp: new Date().toISOString()
 		};
 		
@@ -1134,6 +1154,35 @@ async function handleQueueStop(request: Request, env: Env): Promise<Response> {
 		
 	} catch (error) {
 		console.error('Queue stop error:', error);
+		return new Response(JSON.stringify({
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		}), {
+			status: 500,
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+}
+
+async function handleQueueRetry(request: Request, env: Env): Promise<Response> {
+	if (request.method !== 'POST') {
+		return new Response('Method not allowed', { status: 405 });
+	}
+	
+	try {
+		// Get the QueueManager Durable Object
+		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
+		const doStub = env.QUEUE_MANAGER.get(doId);
+		
+		// Force retry queuing of remaining snippets
+		const result = await doStub.retryQueuing();
+		
+		return new Response(JSON.stringify(result), {
+			headers: { 'Content-Type': 'application/json' }
+		});
+		
+	} catch (error) {
+		console.error('Queue retry error:', error);
 		return new Response(JSON.stringify({
 			success: false,
 			error: error instanceof Error ? error.message : String(error)
@@ -1267,6 +1316,29 @@ export class QueueManager extends DurableObject {
 		return {
 			success: true,
 			message: 'Stop signal sent. Processing will halt after current batch.'
+		};
+	}
+
+	async retryQueuing(): Promise<{ success: boolean; message: string; progress?: QueueProgress }> {
+		const currentProgress = await this.ctx.storage.get<QueueProgress>('progress');
+		
+		if (currentProgress && currentProgress.status === 'processing') {
+			return {
+				success: false,
+				message: 'Queue processing already in progress',
+				progress: currentProgress
+			};
+		}
+
+		// Reset the progress and start again
+		await this.ctx.storage.put('shouldStop', false);
+		
+		// Start the background processing
+		this.startBackgroundQueuing();
+
+		return {
+			success: true,
+			message: 'Restarted queuing process for remaining untagged snippets'
 		};
 	}
 
