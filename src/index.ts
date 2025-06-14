@@ -1066,12 +1066,12 @@ async function handleQueueTagging(request: Request, env: Env): Promise<Response>
 		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
 		const doStub = env.QUEUE_MANAGER.get(doId);
 		
-		// Start queuing via Durable Object
-		const response = await doStub.fetch(new Request('https://do/start-queuing', {
-			method: 'POST'
-		}));
+		// Start queuing via RPC method
+		const result = await doStub.startQueuing();
 		
-		return response;
+		return new Response(JSON.stringify(result), {
+			headers: { 'Content-Type': 'application/json' }
+		});
 		
 	} catch (error) {
 		console.error('Queue tagging error:', error);
@@ -1095,12 +1095,12 @@ async function handleQueueProgress(request: Request, env: Env): Promise<Response
 		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
 		const doStub = env.QUEUE_MANAGER.get(doId);
 		
-		// Get progress from Durable Object
-		const response = await doStub.fetch(new Request('https://do/progress', {
-			method: 'GET'
-		}));
+		// Get progress via RPC method
+		const progress = await doStub.getProgress();
 		
-		return response;
+		return new Response(JSON.stringify(progress), {
+			headers: { 'Content-Type': 'application/json' }
+		});
 		
 	} catch (error) {
 		console.error('Queue progress error:', error);
@@ -1124,12 +1124,12 @@ async function handleQueueStop(request: Request, env: Env): Promise<Response> {
 		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
 		const doStub = env.QUEUE_MANAGER.get(doId);
 		
-		// Send stop signal to Durable Object
-		const response = await doStub.fetch(new Request('https://do/stop', {
-			method: 'POST'
-		}));
+		// Send stop signal via RPC method
+		const result = await doStub.stop();
 		
-		return response;
+		return new Response(JSON.stringify(result), {
+			headers: { 'Content-Type': 'application/json' }
+		});
 		
 	} catch (error) {
 		console.error('Queue stop error:', error);
@@ -1230,72 +1230,51 @@ export class QueueManager {
 		this.env = env;
 	}
 
-	async fetch(request: Request): Promise<Response> {
-		const url = new URL(request.url);
-
-		if (url.pathname === '/start-queuing') {
-			return this.handleStartQueuing();
-		}
-
-		if (url.pathname === '/progress') {
-			return this.handleGetProgress();
-		}
-
-		if (url.pathname === '/stop') {
-			return this.handleStop();
-		}
-
-		return new Response('QueueManager DO\nEndpoints:\n- /start-queuing - Start queuing all untagged snippets\n- /progress - Get current progress\n- /stop - Stop current operation');
-	}
-
-	private async handleStartQueuing(): Promise<Response> {
+	// RPC Methods (recommended approach)
+	async startQueuing(): Promise<{ success: boolean; message: string; note?: string; progress?: QueueProgress }> {
 		const currentProgress = await this.state.storage.get<QueueProgress>('progress');
 		
 		if (currentProgress && currentProgress.status === 'processing') {
-			return new Response(JSON.stringify({
+			return {
 				success: false,
 				message: 'Queue processing already in progress',
 				progress: currentProgress
-			}), {
-				headers: { 'Content-Type': 'application/json' }
-			});
+			};
 		}
 
 		// Start the background processing
 		this.startBackgroundQueuing();
 
-		return new Response(JSON.stringify({
+		return {
 			success: true,
 			message: 'Started queuing all untagged snippets in background',
-			note: 'Use /progress endpoint to check status'
-		}), {
-			headers: { 'Content-Type': 'application/json' }
-		});
+			note: 'Use getProgress() to check status'
+		};
 	}
 
-	private async handleGetProgress(): Promise<Response> {
-		const progress = await this.state.storage.get<QueueProgress>('progress') || {
+	async getProgress(): Promise<QueueProgress> {
+		return await this.state.storage.get<QueueProgress>('progress') || {
 			total: 0,
 			queued: 0,
 			failed: 0,
 			status: 'idle'
 		};
-
-		return new Response(JSON.stringify(progress), {
-			headers: { 'Content-Type': 'application/json' }
-		});
 	}
 
-	private async handleStop(): Promise<Response> {
+	async stop(): Promise<{ success: boolean; message: string }> {
 		await this.state.storage.put('shouldStop', true);
 		
-		return new Response(JSON.stringify({
+		return {
 			success: true,
 			message: 'Stop signal sent. Processing will halt after current batch.'
-		}), {
-			headers: { 'Content-Type': 'application/json' }
-		});
+		};
 	}
+
+	// Legacy fetch handler (kept for compatibility)
+	async fetch(request: Request): Promise<Response> {
+		return new Response('QueueManager DO - Use RPC methods: startQueuing(), getProgress(), stop()');
+	}
+
 
 	private async startBackgroundQueuing(): Promise<void> {
 		try {
