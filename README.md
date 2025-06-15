@@ -17,8 +17,8 @@ The Buche Tag Worker is a Cloudflare Worker that automatically discovers and ass
 
 ## API Endpoints
 
-### POST `/tag-queue` (🌟 Recommended)
-Queue all untagged snippets for AI processing using Cloudflare Queues.
+### POST `/tag-queue` (🌟 Recommended - Durable Object Powered)
+Queue ALL untagged snippets for AI processing using Durable Objects and Cloudflare Queues.
 
 **Request Body:** (empty)
 ```json
@@ -29,29 +29,76 @@ Queue all untagged snippets for AI processing using Cloudflare Queues.
 ```json
 {
   "success": true,
-  "message": "Queued 1,247 snippets for AI tagging",
-  "queuedSnippets": 1247,
-  "totalUntagged": 1247,
-  "processingNote": "Snippets will be processed asynchronously by queue consumers"
+  "message": "Started queuing all untagged snippets in background",
+  "note": "Use getProgress() to check status"
 }
 ```
 
-### GET `/queue-status` (🆕 Queue Monitoring)
-Monitor queue processing progress and status.
+**How it works:**
+- Uses **Durable Object** for persistent background processing
+- **No API rate limits** - processes snippets in small batches with delays
+- **Fire-and-forget** - starts immediately and runs independently
+- **Real-time progress tracking** via separate endpoints
+
+### GET `/tag-queue/progress` (🆕 Real-time Progress)
+Get detailed progress from the Durable Object queue manager.
+
+**Response:**
+```json
+{
+  "total": 1942,
+  "queued": 1763,
+  "failed": 2,
+  "status": "processing",
+  "startedAt": "2025-06-14T23:30:00Z",
+  "lastProcessedId": "snippet_abc_123"
+}
+```
+
+**Status values:**
+- `idle` - No processing active
+- `processing` - Currently queuing snippets
+- `completed` - All snippets queued successfully
+- `error` - Encountered an error
+
+### POST `/tag-queue/retry` (🔧 Troubleshooting)
+Retry queuing any remaining untagged snippets (useful for recovery).
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Restarted queuing process for remaining untagged snippets"
+}
+```
+
+### POST `/tag-queue/stop` (⏹️ Control)
+Stop the current Durable Object queuing process.
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Stop signal sent. Processing will halt after current batch."
+}
+```
+
+### GET `/queue-status` (📊 Enhanced Monitoring)
+Comprehensive queue and database status with diagnostics.
 
 **Response:**
 ```json
 {
   "database": {
-    "totalSnippets": 5000,
-    "taggedSnippets": 3750,
-    "untaggedSnippets": 1250,
-    "totalTags": 45,
-    "processingProgress": "75.0%"
+    "totalSnippets": 1942,
+    "taggedSnippets": 1763,
+    "untaggedSnippets": 179,
+    "totalTags": 571,
+    "processingProgress": "90.8%"
   },
   "queue": {
     "isConfigured": true,
-    "pendingSnippets": 1250,
+    "pendingSnippets": 179,
     "processingMode": "queue-based",
     "consumerSettings": {
       "maxBatchSize": 25,
@@ -60,8 +107,18 @@ Monitor queue processing progress and status.
       "retryDelay": "30 seconds"
     }
   },
+  "durableObject": {
+    "total": 1942,
+    "queued": 1763,
+    "failed": 0,
+    "status": "completed"
+  },
+  "recommendations": [
+    "Run POST /tag-queue/retry to retry queuing remaining snippets",
+    "Check dead letter queue in Cloudflare dashboard for failed messages"
+  ],
   "status": "processing",
-  "timestamp": "2025-01-08T10:30:00.000Z"
+  "timestamp": "2025-06-14T23:41:58Z"
 }
 ```
 
@@ -165,14 +222,35 @@ Initialize the database schema with required tables.
 
 ## Workflow
 
-### 1. Queue-Based Tag Processing (Production)
+### 1. Durable Object-Powered Queue Processing (Production) 🆕
 
-**Queue Processing Flow:**
-1. **Queue All Snippets**: `/tag-queue` endpoint queues all untagged snippets
-2. **Automatic Processing**: Queue consumers process snippets in batches of 25
-3. **Rate Limiting**: Maximum 5 concurrent AI requests with 1-second delays
-4. **Error Handling**: Automatic retry with exponential backoff (30s → 60s → 120s)
-5. **Monitoring**: Real-time progress tracking via `/queue-status`
+**High-Level Architecture:**
+```
+Main Worker → Durable Object → Cloudflare Queue → Queue Consumers
+     ↓              ↓               ↓                ↓
+  API Calls    Background       Message         AI Processing
+              Processing        Storage         & Tagging
+```
+
+**Durable Object Processing Flow:**
+1. **`POST /tag-queue`**: Main worker calls Durable Object via RPC
+2. **Background Queuing**: DO processes ALL untagged snippets in background
+3. **Batched Rate Limiting**: DO queues snippets in batches of 10 with 300ms delays
+4. **Persistent State**: DO tracks progress in durable storage
+5. **Fire-and-Forget**: Returns immediately while DO continues working
+
+**Durable Object Benefits:**
+- ✅ **No API Rate Limits**: Processes in small batches with proper delays
+- ✅ **Persistent Progress**: Survives worker restarts and timeouts
+- ✅ **Real-time Monitoring**: Check progress anytime with `/tag-queue/progress`
+- ✅ **Error Recovery**: Use `/tag-queue/retry` to handle stuck processing
+- ✅ **Scalable**: Handles unlimited snippets without timeout issues
+
+**Queue Consumer Processing:**
+1. **Automatic Processing**: Queue consumers process snippets in batches of 25
+2. **Rate Limiting**: Maximum 5 concurrent AI requests with 1-second delays
+3. **Error Handling**: Automatic retry with exponential backoff (30s → 60s → 120s)
+4. **Dead Letter Queue**: Failed messages after max retries go to DLQ
 
 **For each snippet in the queue:**
 1. **Fetches Content**: Retrieves snippet content from R2 storage
@@ -272,6 +350,12 @@ Configure in `wrangler.jsonc`:
 ```json
 {
   "queues": {
+    "producers": [
+      {
+        "binding": "TAGGING_QUEUE",
+        "queue": "content-tagging-queue"
+      }
+    ],
     "consumers": [
       {
         "queue": "content-tagging-queue",
@@ -286,6 +370,26 @@ Configure in `wrangler.jsonc`:
 }
 ```
 
+### Durable Object Configuration 🆕
+```json
+{
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "QUEUE_MANAGER",
+        "class_name": "QueueManager"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["QueueManager"]
+    }
+  ]
+}
+```
+
 ### Constants
 - `SIMILARITY_THRESHOLD`: 0.8 (text similarity threshold for tag matching)
 - `MAX_TAGS`: 3000 (maximum number of global tags)
@@ -294,42 +398,67 @@ Configure in `wrangler.jsonc`:
 
 ## Usage Example
 
-### Complete Workflow (Queue-Based)
+### Complete Workflow (Durable Object + Queue-Based) 🆕
 
 1. **Initialize Schema**:
 ```bash
 curl -X POST https://your-worker.workers.dev/init-schema
 ```
 
-2. **🚀 Queue All Snippets for Processing**:
+2. **🚀 Start Durable Object Queue Processing**:
 ```bash
 curl -X POST https://your-worker.workers.dev/tag-queue
+# Response: {"success": true, "message": "Started queuing all untagged snippets in background"}
 ```
 
-3. **📊 Monitor Processing Progress**:
+3. **📊 Real-time Progress Monitoring**:
 ```bash
-# Check detailed queue status
+# Check Durable Object progress (detailed)
+curl https://your-worker.workers.dev/tag-queue/progress
+
+# Check overall system status (comprehensive)
 curl https://your-worker.workers.dev/queue-status
 
-# Check general status
+# Check basic database status
 curl https://your-worker.workers.dev/status
 ```
 
-4. **Preview Consolidation Plan**:
+**Sample Progress Response:**
+```json
+{
+  "total": 1942,
+  "queued": 1763,
+  "failed": 2,
+  "status": "processing",
+  "startedAt": "2025-06-14T23:30:00Z",
+  "lastProcessedId": "snippet_abc_123"
+}
+```
+
+4. **🔧 Troubleshooting (if needed)**:
+```bash
+# If processing gets stuck at 90%, retry remaining snippets
+curl -X POST https://your-worker.workers.dev/tag-queue/retry
+
+# Stop processing if needed
+curl -X POST https://your-worker.workers.dev/tag-queue/stop
+```
+
+5. **Preview Consolidation Plan**:
 ```bash
 curl -X POST https://your-worker.workers.dev/consolidate \
   -H "Content-Type: application/json" \
   -d '{"dryRun": true}'
 ```
 
-5. **Execute Consolidation**:
+6. **Execute Consolidation**:
 ```bash
 curl -X POST https://your-worker.workers.dev/consolidate \
   -H "Content-Type: application/json" \
   -d '{}'
 ```
 
-6. **Check Final Results**:
+7. **Check Final Results**:
 ```bash
 curl https://your-worker.workers.dev/status
 curl https://your-worker.workers.dev/tags
@@ -376,13 +505,22 @@ npm run dev
 npm run deploy
 ```
 
-## Advantages of Queue-Based Architecture
+## Advantages of Durable Object + Queue Architecture 🆕
+
+### Durable Object Benefits
+- **🚀 No API Rate Limits**: Processes snippets in small batches with proper delays
+- **💾 Persistent State**: Survives worker restarts, timeouts, and deployments
+- **🔄 Background Processing**: Fire-and-forget operation with real-time progress tracking
+- **🛡️ Error Recovery**: Built-in retry mechanisms and manual recovery options
+- **📊 Real-time Monitoring**: Check progress anytime without interrupting processing
+- **⚡ Instant Response**: API calls return immediately while processing continues
+- **🎯 Precision Control**: Stop, retry, or monitor processing at any time
 
 ### Production Benefits
 - **🚀 No Timeouts**: Queue processing eliminates worker timeout limits
 - **⚡ Automatic Scaling**: Cloudflare automatically scales queue consumers based on backlog
 - **🔄 Built-in Retry**: Automatic retry logic with exponential backoff for failed messages
-- **📊 Real-time Monitoring**: Detailed queue metrics and processing progress
+- **📊 Comprehensive Monitoring**: Detailed queue metrics, DO progress, and diagnostics
 - **🛡️ Rate Limit Protection**: Built-in rate limiting prevents AI API quota exhaustion
 
 ### Two-Phase Processing Benefits
@@ -392,15 +530,21 @@ npm run deploy
 - **Cost Effective**: Minimal AI usage during high-volume tagging phase
 - **Reviewable**: Dry-run mode lets you preview consolidations before applying
 
-### Queue vs Legacy Comparison
-| Aspect | Legacy Batch Mode | Queue-Based Processing |
-|--------|-------------------|------------------------|
-| **Timeout Issues** | Yes (worker limits) | No (asynchronous) |
-| **Rate Limiting** | Manual management | Automatic with retry |
-| **Scalability** | Limited by batch size | Unlimited (auto-scaling) |
-| **Error Handling** | Manual retry required | Automatic retry with backoff |
-| **Monitoring** | Basic progress tracking | Detailed queue metrics |
-| **Production Ready** | No (timeouts on large datasets) | Yes (any dataset size) |
+### Architecture Comparison
+| Aspect | Legacy Batch | Queue-Based | **Durable Object + Queue** |
+|--------|--------------|-------------|-------------------------|
+| **API Rate Limits** | ❌ Hits limits | ❌ Hits limits | ✅ **No limits** |
+| **Timeout Issues** | ❌ Worker limits | ✅ Asynchronous | ✅ **Background processing** |
+| **Progress Tracking** | ❌ Basic | ✅ Queue metrics | ✅ **Real-time + persistent** |
+| **Error Recovery** | ❌ Manual retry | ✅ Auto retry | ✅ **Smart recovery + manual control** |
+| **Scalability** | ❌ Limited | ✅ Auto-scaling | ✅ **Unlimited + persistent** |
+| **Production Ready** | ❌ No | ✅ Yes | ✅ **Enterprise-grade** |
+
+### RPC vs HTTP Communication 🆕
+- **Type Safety**: Direct method calls with TypeScript support
+- **Performance**: No HTTP serialization overhead
+- **Simplicity**: Clean method calls instead of URL routing
+- **Reliability**: Direct RPC calls are more reliable than HTTP requests
 
 ## Error Handling
 
