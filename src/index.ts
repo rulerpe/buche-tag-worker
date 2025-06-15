@@ -68,30 +68,40 @@ interface QueueProgress {
 
 const SIMILARITY_THRESHOLD = 0.8; // Text similarity threshold
 const MAX_TAGS = 3000;
-const TAG_PROMPT = `分析这段情色内容片段，至少为一下每个方面各生成标签，每个标签2个字：
+// Multi-agent prompts for focused tagging
+const SEXUAL_ACTS_PROMPT = `分析这段情色内容，专注识别具体的性爱行为和玩法。
 
-**性爱玩法/活动：**
-- 具体性行为（口交、肛交、69等）
+请为以下方面生成2个字的中文标签：
+- 具体性行为（口交、肛交、指交、舔弄等）
 - 性爱体位和技巧
 - 前戏活动
-- 癖好和恋物
+- 特殊癖好和恋物
 
-**背景/氛围：**
-- 时代背景（现代、古代、未来等）
-- 题材类型（玄幻、科幻、现代、古装等）
-- 场所类型（卧室、户外、职场等）
-- 文化背景
+只返回相关的标签名称，每行一个，每个标签2个字。如果内容中没有明确的性爱行为，返回"无"。
 
-**强度：**
-- 情感强度（温柔、激情、粗暴、轻柔）
-- 身体强度（缓慢、激烈、狂野、感性）
-- 权力关系（主导、服从、平等）
+内容：`;
 
-**附加情境：**
-- 角色关系和互动
-- 情感基调和氛围
+const CONTEXT_SETTING_PROMPT = `分析这段情色内容的背景和情境设定。
 
-只返回标签名称，每行一个，不需要解释或分类。
+请为以下方面生成2个字的中文标签：
+- 场所环境（卧室、浴室、办公室、户外等）
+- 时代背景（现代、古代、民国等）
+- 题材类型（都市、玄幻、校园、职场等）
+- 角色关系（恋人、夫妻、师生、陌生人等）
+
+只返回相关的标签名称，每行一个，每个标签2个字。如果某方面不明确，可以不生成对应标签。
+
+内容：`;
+
+const INTENSITY_ATTRIBUTES_PROMPT = `分析这段情色内容的强度和情感属性。
+
+请为以下方面生成2个字的中文标签：
+- 情感强度（温柔、激情、粗暴、轻柔等）
+- 身体强度（缓慢、激烈、狂野、温和等）
+- 权力关系（主导、服从、平等、支配等）
+- 情感氛围（浪漫、禁忌、刺激、甜蜜等）
+
+只返回相关的标签名称，每行一个，每个标签2个字。重点关注内容的情感色彩和强度特征。
 
 内容：`;
 
@@ -354,41 +364,116 @@ async function processSnippet(snippetId: string, env: Env, stats: TaggingStats):
 	}
 }
 
+// Multi-agent tagging with 3 focused passes
 async function generateProposedTags(content: string, ai: Ai): Promise<string[]> {
 	try {
 		// Truncate content if too long (AI models have token limits)
 		const truncatedContent = content.length > 2000 ? content.substring(0, 2000) + '...' : content;
 		
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
-			messages: [
-				{
-					role: 'user',
-					content: TAG_PROMPT + truncatedContent
-				}
-			],
-			max_tokens: 100
-		}) as any;
+		// Run all 3 passes in parallel for efficiency
+		const [sexualActsTags, contextTags, intensityTags] = await Promise.all([
+			generateSexualActsTags(truncatedContent, ai),
+			generateContextTags(truncatedContent, ai),
+			generateIntensityTags(truncatedContent, ai)
+		]);
 		
-		const result = response.response as string;
+		// Combine all tags from the 3 passes
+		const allTags = [...sexualActsTags, ...contextTags, ...intensityTags];
 		
-		// Parse the response to extract tag names
-		const rawTags = result
-			.split('\n')
-			.map(line => line.trim())
-			.filter(line => line.length > 0 && !line.includes(':'))
-			.slice(0, 8); // Allow up to 8 tags as requested
+		// Remove duplicates and limit total tags
+		const uniqueTags = [...new Set(allTags)];
 		
-		// Clean and filter tags
-		const cleanedTags = rawTags
-			.map(tag => cleanTag(tag))
-			.filter(tag => tag.length > 0 && tag.length <= 4)
-			.filter(tag => isValidChineseTag(tag));
+		// Limit to maximum 12 tags (4 from each pass)
+		return uniqueTags.slice(0, 12);
 		
-		return cleanedTags;
 	} catch (error) {
 		console.error('Error generating proposed tags:', error);
 		return [];
 	}
+}
+
+// Pass 1: Sexual acts and behaviors
+async function generateSexualActsTags(content: string, ai: Ai): Promise<string[]> {
+	try {
+		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+			messages: [
+				{
+					role: 'user',
+					content: SEXUAL_ACTS_PROMPT + content
+				}
+			],
+			max_tokens: 50
+		}) as any;
+		
+		const result = response.response as string;
+		return parseTagResponse(result);
+		
+	} catch (error) {
+		console.error('Error generating sexual acts tags:', error);
+		return [];
+	}
+}
+
+// Pass 2: Context and setting
+async function generateContextTags(content: string, ai: Ai): Promise<string[]> {
+	try {
+		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+			messages: [
+				{
+					role: 'user',
+					content: CONTEXT_SETTING_PROMPT + content
+				}
+			],
+			max_tokens: 50
+		}) as any;
+		
+		const result = response.response as string;
+		return parseTagResponse(result);
+		
+	} catch (error) {
+		console.error('Error generating context tags:', error);
+		return [];
+	}
+}
+
+// Pass 3: Intensity and attributes
+async function generateIntensityTags(content: string, ai: Ai): Promise<string[]> {
+	try {
+		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+			messages: [
+				{
+					role: 'user',
+					content: INTENSITY_ATTRIBUTES_PROMPT + content
+				}
+			],
+			max_tokens: 50
+		}) as any;
+		
+		const result = response.response as string;
+		return parseTagResponse(result);
+		
+	} catch (error) {
+		console.error('Error generating intensity tags:', error);
+		return [];
+	}
+}
+
+// Parse AI response and extract valid tags
+function parseTagResponse(result: string): string[] {
+	// Parse the response to extract tag names
+	const rawTags = result
+		.split('\n')
+		.map(line => line.trim())
+		.filter(line => line.length > 0 && !line.includes(':') && line !== '无')
+		.slice(0, 4); // Max 4 tags per pass
+	
+	// Clean and filter tags
+	const cleanedTags = rawTags
+		.map(tag => cleanTag(tag))
+		.filter(tag => tag.length > 0 && tag.length <= 4)
+		.filter(tag => isValidChineseTag(tag));
+	
+	return cleanedTags;
 }
 
 function cleanTag(tag: string): string {
@@ -402,7 +487,12 @@ function cleanTag(tag: string): string {
 function isValidChineseTag(tag: string): boolean {
 	// Check if tag contains at least one Chinese character and is not empty
 	const chineseRegex = /[\u4e00-\u9fff\u3400-\u4dbf\u20000-\u2a6df\u2a700-\u2b73f\u2b740-\u2b81f\u2b820-\u2ceaf\u2ceb0-\u2ebef\u30000-\u3134f]/;
-	return tag.length > 0 && tag.length <= 4 && chineseRegex.test(tag);
+	
+	// More strict validation: exactly 2 Chinese characters for focused tags
+	const isExactlyTwoChars = tag.length === 2;
+	const hasOnlyChineseChars = /^[\u4e00-\u9fff]+$/.test(tag);
+	
+	return isExactlyTwoChars && hasOnlyChineseChars && chineseRegex.test(tag);
 }
 
 async function processProposedTag(proposedTag: string, env: Env, stats: TaggingStats): Promise<number | null> {
@@ -1198,8 +1288,8 @@ async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, ctx: Exe
 	
 	await initializeDatabase(env.CONTENT_DB);
 	
-	// Process messages with rate limiting (max 5 concurrent AI requests)
-	const CONCURRENT_LIMIT = 5;
+	// Process messages with rate limiting (reduced from 5 to 3 due to 3x AI calls per snippet)
+	const CONCURRENT_LIMIT = 3;
 	const chunks = chunkArray([...batch.messages], CONCURRENT_LIMIT);
 	
 	for (const chunk of chunks) {
