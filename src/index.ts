@@ -380,12 +380,14 @@ async function generateProposedTags(content: string, ai: Ai): Promise<string[]> 
 		// Truncate content if too long (AI models have token limits)
 		const truncatedContent = content.length > 2000 ? content.substring(0, 2000) + '...' : content;
 		
-		// Run all 3 passes in parallel for efficiency
-		const [sexualActsTags, contextTags, intensityTags] = await Promise.all([
-			generateSexualActsTags(truncatedContent, ai),
-			generateContextTags(truncatedContent, ai),
-			generateIntensityTags(truncatedContent, ai)
-		]);
+		// Run all 3 passes sequentially to prevent AI capacity exceeded errors
+		const sexualActsTags = await generateSexualActsTags(truncatedContent, ai);
+		await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay between AI calls
+		
+		const contextTags = await generateContextTags(truncatedContent, ai);
+		await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay between AI calls
+		
+		const intensityTags = await generateIntensityTags(truncatedContent, ai);
 		
 		// Combine all tags from the 3 passes
 		const allTags = [...sexualActsTags, ...contextTags, ...intensityTags];
@@ -1333,8 +1335,8 @@ async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, ctx: Exe
 	
 	await initializeDatabase(env.CONTENT_DB);
 	
-	// Process messages with rate limiting (reduced from 5 to 3 due to 3x AI calls per snippet)
-	const CONCURRENT_LIMIT = 3;
+	// Process messages with rate limiting (reduced to 1 to prevent AI capacity exceeded errors)
+	const CONCURRENT_LIMIT = 1;
 	const chunks = chunkArray([...batch.messages], CONCURRENT_LIMIT);
 	
 	for (const chunk of chunks) {
@@ -1363,7 +1365,14 @@ async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, ctx: Exe
 				
 				// Handle different types of errors
 				if (error instanceof Error) {
-					if (error.message.includes('Too many API requests') || 
+					if (error.message.includes('3040') || 
+					    error.message.includes('Capacity temporarily exceeded')) {
+						// AI capacity exceeded error - retry with exponential backoff
+						const retryCount = message.attempts || 1;
+						const backoffDelay = Math.min(300, 30 * Math.pow(2, retryCount - 1)); // Max 5 minutes
+						console.log(`AI capacity exceeded for snippet ${(message.body as QueueMessage).snippetId}, retrying with ${backoffDelay}s delay (attempt ${retryCount})`);
+						message.retry({ delaySeconds: backoffDelay });
+					} else if (error.message.includes('Too many API requests') || 
 					    error.message.includes('rate limit') ||
 					    error.message.includes('429')) {
 						// Rate limit error - retry with delay
@@ -1390,9 +1399,9 @@ async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, ctx: Exe
 			}
 		}));
 		
-		// Add small delay between chunks to prevent overwhelming the AI API
+		// Add delay between chunks to prevent overwhelming the AI API
 		if (chunks.indexOf(chunk) < chunks.length - 1) {
-			await new Promise(resolve => setTimeout(resolve, 1000));
+			await new Promise(resolve => setTimeout(resolve, 2000)); // Increased to 2 seconds
 		}
 	}
 }
