@@ -64,6 +64,12 @@ interface QueueProgress {
 	completedAt?: string;
 	lastProcessedId?: string;
 	errorMessage?: string;
+	// Chunked processing fields
+	chunkSize: number;
+	currentChunk: number;
+	totalChunks: number;
+	resumeFromId?: string;
+	processedChunks: number;
 }
 
 const SIMILARITY_THRESHOLD = 0.8; // Text similarity threshold
@@ -153,7 +159,11 @@ export default {
 			return handleQueueRetry(request, env);
 		}
 		
-		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue ALL untagged snippets for AI processing via Durable Object\n- GET /tag-queue/progress - Get queue progress from Durable Object\n- POST /tag-queue/stop - Stop queue processing\n- POST /tag-queue/retry - Retry queuing remaining untagged snippets\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
+		if (url.pathname === '/tag-queue/chunk-size') {
+			return handleChunkSizeConfig(request, env);
+		}
+		
+		return new Response('Buche Tag Worker\n\nEndpoints:\n- POST /tag - Start tagging process (legacy batch mode)\n- POST /tag-queue - Queue ALL untagged snippets for AI processing via Durable Object\n- GET /tag-queue/progress - Get queue progress from Durable Object\n- POST /tag-queue/stop - Stop queue processing\n- POST /tag-queue/retry - Retry queuing remaining untagged snippets\n- GET/POST /tag-queue/chunk-size - Get or set chunk size for processing\n- GET /status - Check tagging status\n- GET /queue-status - Check queue processing status\n- GET /tags - List all tags\n- POST /init-schema - Initialize database schema\n- POST /consolidate - Consolidate similar tags\n- POST /clear-tags - Clear all tags and reset snippets');
 	},
 
 	async queue(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -1283,6 +1293,41 @@ async function handleQueueRetry(request: Request, env: Env): Promise<Response> {
 	}
 }
 
+async function handleChunkSizeConfig(request: Request, env: Env): Promise<Response> {
+	try {
+		// Get the QueueManager Durable Object
+		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
+		const doStub = env.QUEUE_MANAGER.get(doId);
+		
+		if (request.method === 'GET') {
+			// Get current chunk size
+			const chunkSize = await doStub.getChunkSize();
+			return new Response(JSON.stringify({ chunkSize }), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		} else if (request.method === 'POST') {
+			// Set new chunk size
+			const body = await request.json() as { chunkSize: number };
+			const result = await doStub.setChunkSize(body.chunkSize);
+			return new Response(JSON.stringify(result), {
+				headers: { 'Content-Type': 'application/json' }
+			});
+		} else {
+			return new Response('Method not allowed', { status: 405 });
+		}
+		
+	} catch (error) {
+		console.error('Chunk size config error:', error);
+		return new Response(JSON.stringify({
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		}), {
+			status: 500,
+			headers: { 'Content-Type': 'application/json' }
+		});
+	}
+}
+
 async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, ctx: ExecutionContext): Promise<void> {
 	console.log(`Processing queue batch of ${batch.messages.length} messages`);
 	
@@ -1369,6 +1414,16 @@ export class QueueManager extends DurableObject {
 		this.env = env;
 	}
 
+	// Configuration constants
+	private static readonly DEFAULT_CHUNK_SIZE = 50;
+	private static readonly CHUNK_DELAY_MS = 1000; // 1 second between chunks
+
+	// Alarm handler for chunked processing
+	async alarm(): Promise<void> {
+		console.log('QueueManager: Alarm triggered, continuing chunked processing');
+		await this.processNextChunk();
+	}
+
 	// RPC Methods (recommended approach)
 	async startQueuing(): Promise<{ success: boolean; message: string; note?: string; progress?: QueueProgress }> {
 		const currentProgress = await this.ctx.storage.get<QueueProgress>('progress');
@@ -1396,7 +1451,11 @@ export class QueueManager extends DurableObject {
 			total: 0,
 			queued: 0,
 			failed: 0,
-			status: 'idle'
+			status: 'idle',
+			chunkSize: QueueManager.DEFAULT_CHUNK_SIZE,
+			currentChunk: 0,
+			totalChunks: 0,
+			processedChunks: 0
 		};
 	}
 
@@ -1432,6 +1491,35 @@ export class QueueManager extends DurableObject {
 		};
 	}
 
+	async setChunkSize(chunkSize: number): Promise<{ success: boolean; message: string }> {
+		if (chunkSize < 1 || chunkSize > 200) {
+			return {
+				success: false,
+				message: 'Chunk size must be between 1 and 200'
+			};
+		}
+
+		const progress = await this.ctx.storage.get<QueueProgress>('progress');
+		if (progress && progress.status === 'processing') {
+			return {
+				success: false,
+				message: 'Cannot change chunk size while processing is active'
+			};
+		}
+
+		await this.ctx.storage.put('chunkSize', chunkSize);
+		
+		return {
+			success: true,
+			message: `Chunk size set to ${chunkSize}`
+		};
+	}
+
+	async getChunkSize(): Promise<number> {
+		const chunkSize = await this.ctx.storage.get<number>('chunkSize');
+		return chunkSize || QueueManager.DEFAULT_CHUNK_SIZE;
+	}
+
 	// Legacy fetch handler (kept for compatibility)
 	async fetch(request: Request): Promise<Response> {
 		return new Response('QueueManager DO - Use RPC methods: startQueuing(), getProgress(), stop()');
@@ -1446,87 +1534,56 @@ export class QueueManager extends DurableObject {
 				throw new Error('TAGGING_QUEUE not configured');
 			}
 
-			// Initialize progress
-			const progress: QueueProgress = {
-				total: 0,
-				queued: 0,
-				failed: 0,
-				status: 'processing',
-				startedAt: new Date().toISOString()
-			};
+			// Get total count of untagged snippets for initialization
+			const countResult = await this.env.CONTENT_DB.prepare(
+				'SELECT COUNT(*) as count FROM snippets WHERE (tags IS NULL OR tags = "[]")'
+			).first() as { count: number };
 
-			// Get all untagged snippets
-			const untaggedSnippets = await this.env.CONTENT_DB.prepare(
-				'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id'
-			).all();
+			const totalCount = countResult.count;
 
-			const snippetIds = untaggedSnippets.results as unknown as { id: string }[];
-			progress.total = snippetIds.length;
-
-			await this.ctx.storage.put('progress', progress);
-			await this.ctx.storage.put('shouldStop', false);
-
-			if (snippetIds.length === 0) {
-				progress.status = 'completed';
-				progress.completedAt = new Date().toISOString();
+			if (totalCount === 0) {
+				const progress: QueueProgress = {
+					total: 0,
+					queued: 0,
+					failed: 0,
+					status: 'completed',
+					startedAt: new Date().toISOString(),
+					completedAt: new Date().toISOString(),
+					chunkSize: QueueManager.DEFAULT_CHUNK_SIZE,
+					currentChunk: 0,
+					totalChunks: 0,
+					processedChunks: 0
+				};
 				await this.ctx.storage.put('progress', progress);
 				return;
 			}
 
-			console.log(`QueueManager: Starting to queue ${snippetIds.length} untagged snippets`);
+			// Initialize chunked progress
+			const chunkSize = await this.getChunkSize();
+			const totalChunks = Math.ceil(totalCount / chunkSize);
 
-			// Process in small batches with delays
-			const BATCH_SIZE = 10;
-			const DELAY_MS = 300;
-			const timestamp = Date.now();
+			const progress: QueueProgress = {
+				total: totalCount,
+				queued: 0,
+				failed: 0,
+				status: 'processing',
+				startedAt: new Date().toISOString(),
+				chunkSize: chunkSize,
+				currentChunk: 1,
+				totalChunks: totalChunks,
+				processedChunks: 0
+			};
 
-			for (let i = 0; i < snippetIds.length; i += BATCH_SIZE) {
-				// Check if we should stop
-				const shouldStop = await this.ctx.storage.get<boolean>('shouldStop');
-				if (shouldStop) {
-					progress.status = 'idle';
-					progress.errorMessage = 'Stopped by user request';
-					await this.ctx.storage.put('progress', progress);
-					return;
-				}
-
-				const batch = snippetIds.slice(i, i + BATCH_SIZE);
-				console.log(`QueueManager: Processing batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(snippetIds.length / BATCH_SIZE)} (${batch.length} snippets)`);
-
-				// Queue each snippet in this batch
-				for (const snippet of batch) {
-					try {
-						await this.env.TAGGING_QUEUE.send({
-							snippetId: snippet.id,
-							timestamp: timestamp,
-							priority: 'medium'
-						});
-						progress.queued++;
-						progress.lastProcessedId = snippet.id;
-					} catch (error) {
-						console.error(`QueueManager: Failed to queue snippet ${snippet.id}:`, error);
-						progress.failed++;
-					}
-				}
-
-				// Update progress
-				await this.ctx.storage.put('progress', progress);
-
-				// Add delay between batches (except for last batch)
-				if (i + BATCH_SIZE < snippetIds.length) {
-					await new Promise(resolve => setTimeout(resolve, DELAY_MS));
-				}
-			}
-
-			// Mark as completed
-			progress.status = 'completed';
-			progress.completedAt = new Date().toISOString();
 			await this.ctx.storage.put('progress', progress);
+			await this.ctx.storage.put('shouldStop', false);
 
-			console.log(`QueueManager: Completed queuing. Success: ${progress.queued}, Failed: ${progress.failed}`);
+			console.log(`QueueManager: Starting chunked queuing for ${totalCount} snippets (${totalChunks} chunks of ${chunkSize})`);
+
+			// Process first chunk immediately
+			await this.processNextChunk();
 
 		} catch (error) {
-			console.error('QueueManager: Error during background queuing:', error);
+			console.error('QueueManager: Error during background queuing initialization:', error);
 			
 			const progress: QueueProgress = {
 				total: 0,
@@ -1534,8 +1591,127 @@ export class QueueManager extends DurableObject {
 				failed: 0,
 				status: 'error',
 				startedAt: new Date().toISOString(),
-				errorMessage: error instanceof Error ? error.message : String(error)
+				errorMessage: error instanceof Error ? error.message : String(error),
+				chunkSize: QueueManager.DEFAULT_CHUNK_SIZE,
+				currentChunk: 0,
+				totalChunks: 0,
+				processedChunks: 0
 			};
+			
+			await this.ctx.storage.put('progress', progress);
+		}
+	}
+
+	private async processNextChunk(): Promise<void> {
+		try {
+			const progress = await this.ctx.storage.get<QueueProgress>('progress');
+			if (!progress || progress.status !== 'processing') {
+				console.log('QueueManager: No active processing to continue');
+				return;
+			}
+
+			// Check if we should stop
+			const shouldStop = await this.ctx.storage.get<boolean>('shouldStop');
+			if (shouldStop) {
+				progress.status = 'idle';
+				progress.errorMessage = 'Stopped by user request';
+				await this.ctx.storage.put('progress', progress);
+				return;
+			}
+
+			// Check if we're done
+			if (progress.processedChunks >= progress.totalChunks) {
+				progress.status = 'completed';
+				progress.completedAt = new Date().toISOString();
+				await this.ctx.storage.put('progress', progress);
+				console.log(`QueueManager: Completed all chunks. Success: ${progress.queued}, Failed: ${progress.failed}`);
+				return;
+			}
+
+			// Get next chunk of untagged snippets
+			const offset = progress.processedChunks * progress.chunkSize;
+			const query = progress.resumeFromId ? 
+				'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") AND id > ? ORDER BY id LIMIT ?' :
+				'SELECT id FROM snippets WHERE (tags IS NULL OR tags = "[]") ORDER BY id LIMIT ? OFFSET ?';
+			
+			const params = progress.resumeFromId ? 
+				[progress.resumeFromId, progress.chunkSize] :
+				[progress.chunkSize, offset];
+
+			const snippetResults = await this.env.CONTENT_DB.prepare(query).bind(...params).all();
+			const snippetIds = snippetResults.results as unknown as { id: string }[];
+
+			if (snippetIds.length === 0) {
+				// No more snippets to process
+				progress.status = 'completed';
+				progress.completedAt = new Date().toISOString();
+				await this.ctx.storage.put('progress', progress);
+				console.log(`QueueManager: No more snippets to process. Completed.`);
+				return;
+			}
+
+			console.log(`QueueManager: Processing chunk ${progress.processedChunks + 1}/${progress.totalChunks} (${snippetIds.length} snippets)`);
+
+			const timestamp = Date.now();
+			let chunkQueued = 0;
+			let chunkFailed = 0;
+
+			// Process snippets in current chunk
+			for (const snippet of snippetIds) {
+				try {
+					await this.env.TAGGING_QUEUE.send({
+						snippetId: snippet.id,
+						timestamp: timestamp,
+						priority: 'medium'
+					});
+					chunkQueued++;
+					progress.lastProcessedId = snippet.id;
+					progress.resumeFromId = snippet.id;
+				} catch (error) {
+					console.error(`QueueManager: Failed to queue snippet ${snippet.id}:`, error);
+					chunkFailed++;
+				}
+			}
+
+			// Update progress
+			progress.queued += chunkQueued;
+			progress.failed += chunkFailed;
+			progress.processedChunks++;
+			progress.currentChunk = progress.processedChunks + 1;
+
+			await this.ctx.storage.put('progress', progress);
+
+			console.log(`QueueManager: Chunk completed. Queued: ${chunkQueued}, Failed: ${chunkFailed}. Total progress: ${progress.processedChunks}/${progress.totalChunks}`);
+
+			// Schedule next chunk if not completed
+			if (progress.processedChunks < progress.totalChunks) {
+				const nextAlarmTime = Date.now() + QueueManager.CHUNK_DELAY_MS;
+				await this.ctx.storage.setAlarm(nextAlarmTime);
+				console.log(`QueueManager: Scheduled next chunk in ${QueueManager.CHUNK_DELAY_MS}ms`);
+			} else {
+				progress.status = 'completed';
+				progress.completedAt = new Date().toISOString();
+				await this.ctx.storage.put('progress', progress);
+				console.log(`QueueManager: All chunks completed. Total: Success: ${progress.queued}, Failed: ${progress.failed}`);
+			}
+
+		} catch (error) {
+			console.error('QueueManager: Error during chunk processing:', error);
+			
+			const progress = await this.ctx.storage.get<QueueProgress>('progress') || {
+				total: 0,
+				queued: 0,
+				failed: 0,
+				status: 'error' as const,
+				startedAt: new Date().toISOString(),
+				chunkSize: QueueManager.DEFAULT_CHUNK_SIZE,
+				currentChunk: 0,
+				totalChunks: 0,
+				processedChunks: 0
+			};
+			
+			progress.status = 'error';
+			progress.errorMessage = error instanceof Error ? error.message : String(error);
 			
 			await this.ctx.storage.put('progress', progress);
 		}

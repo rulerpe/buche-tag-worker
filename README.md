@@ -8,7 +8,10 @@ The Buche Tag Worker is a Cloudflare Worker that automatically discovers and ass
 - **⚡ Rate Limit Protection**: Built-in rate limiting and retry logic for AI API calls
 - **🔄 Automatic Retry**: Smart error handling with exponential backoff
 - **📊 Real-time Monitoring**: Detailed queue status and progress tracking
-- **🤖 AI Tag Discovery**: Uses AI to analyze content and propose meaningful tags
+- **🤖 Multi-Agent AI Tagging**: 3-pass focused analysis for superior tag quality:
+  - Pass 1: Sexual acts and behaviors (activities, positions, foreplay)
+  - Pass 2: Context and setting (location, time period, relationships)
+  - Pass 3: Intensity and attributes (emotional/physical intensity, power dynamics)
 - **🔀 Smart Tag Merging**: Employs text similarity to merge similar tags during processing
 - **🧠 Intelligent Consolidation**: AI-powered post-processing to group semantically similar tags
 - **🎯 Limited Tag Set**: Maintains a curated set of 20-30 global tags to prevent tag explosion
@@ -248,17 +251,21 @@ Main Worker → Durable Object → Cloudflare Queue → Queue Consumers
 
 **Queue Consumer Processing:**
 1. **Automatic Processing**: Queue consumers process snippets in batches of 25
-2. **Rate Limiting**: Maximum 5 concurrent AI requests with 1-second delays
+2. **Rate Limiting**: Maximum 3 concurrent snippets (reduced due to 3x AI calls per snippet)
 3. **Error Handling**: Automatic retry with exponential backoff (30s → 60s → 120s)
 4. **Dead Letter Queue**: Failed messages after max retries go to DLQ
 
 **For each snippet in the queue:**
 1. **Fetches Content**: Retrieves snippet content from R2 storage
-2. **AI Analysis**: Uses LLaMA 4 Scout to analyze content and propose 5-8 descriptive tags
-3. **Text Similarity Check**: Compares proposed tags against existing tags using text similarity
-4. **Tag Matching**: Uses normalized edit distance (threshold: 0.8) to find similar tags
-5. **Tag Assignment**: Either assigns existing similar tag or creates new one (if under 3000-tag limit)
-6. **Acknowledgment**: Message acknowledged on success or retried on failure
+2. **Multi-Agent AI Analysis**: 3 parallel AI passes using LLaMA 4 Scout (up to 12 tags total):
+   - Pass 1: Sexual acts and behaviors (max 4 tags)
+   - Pass 2: Context and setting (max 4 tags)  
+   - Pass 3: Intensity and attributes (max 4 tags)
+3. **Tag Validation**: Strict filtering for exactly 2 Chinese characters per tag
+4. **Text Similarity Check**: Compares proposed tags against existing tags using text similarity
+5. **Tag Matching**: Uses normalized edit distance (threshold: 0.8) to find similar tags
+6. **Tag Assignment**: Either assigns existing similar tag or creates new one (if under 3000-tag limit)
+7. **Acknowledgment**: Message acknowledged on success or retried on failure
 
 ### 2. Tag Consolidation Process (Smart)
 
@@ -317,7 +324,11 @@ CREATE TABLE snippet_tags (
 
 ## AI Models Used
 
-- **Text Generation**: `@cf/meta/llama-3.1-8b-instruct` for tag proposal and consolidation analysis
+- **Multi-Agent Tagging**: `@cf/meta/llama-4-scout-17b-16e-instruct` with 3 specialized prompts:
+  - Sexual acts analysis (50 tokens max)
+  - Context/setting analysis (50 tokens max)  
+  - Intensity/attributes analysis (50 tokens max)
+- **Tag Consolidation**: `@cf/meta/llama-4-scout-17b-16e-instruct` for semantic similarity analysis
 - **Text Similarity**: Levenshtein distance algorithm for tag matching
 
 ## Configuration
@@ -393,8 +404,9 @@ Configure in `wrangler.jsonc`:
 ### Constants
 - `SIMILARITY_THRESHOLD`: 0.8 (text similarity threshold for tag matching)
 - `MAX_TAGS`: 3000 (maximum number of global tags)
-- `CONCURRENT_LIMIT`: 5 (max concurrent AI requests per batch)
+- `CONCURRENT_LIMIT`: 3 (max concurrent snippets per batch - reduced due to 3x AI calls)
 - `BATCH_DELAY`: 1000ms (delay between processing batches)
+- `MAX_TOKENS_PER_PASS`: 50 (tokens per AI pass - focused prompts need fewer tokens)
 
 ## Usage Example
 
