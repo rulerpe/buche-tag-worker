@@ -1147,7 +1147,7 @@ async function handleQueueStatus(request: Request, env: Env): Promise<Response> 
 				pendingSnippets: untaggedSnippets,
 				processingMode: 'queue-based',
 				consumerSettings: {
-					maxBatchSize: 25,
+					maxBatchSize: 5,
 					maxBatchTimeout: '15 seconds',
 					maxRetries: 5,
 					retryDelay: '30 seconds'
