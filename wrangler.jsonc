@@ -13,7 +13,8 @@
 	"r2_buckets": [
 		{
 			"binding": "CONTENT_BUCKET",
-			"bucket_name": "erotic-content-snippets"
+			"bucket_name": "erotic-content-snippets",
+			"preview_bucket_name": "erotic-content-snippets"
 		}
 	],
 	"d1_databases": [
@@ -23,8 +24,8 @@
 			"database_id": "8e226f8f-1736-440d-aa99-1df8e5ff1397"
 		}
 	],
-	"ai": {
-		"binding": "AI"
+	"vars": {
+		"OPENROUTER_API_URL": "https://openrouter.ai/api/v1/chat/completions"
 	},
 	"queues": {
 		"producers": [
@@ -36,11 +37,11 @@
 		"consumers": [
 			{
 				"queue": "content-tagging-queue",
-				"max_batch_size": 5,
-				"max_batch_timeout": 15,
-				"max_retries": 5,
+				"max_batch_size": 10,
+				"max_batch_timeout": 30,
+				"max_retries": 3,
 				"dead_letter_queue": "content-tagging-dlq",
-				"retry_delay": 30
+				"retry_delay": 60
 			}
 		]
 	},

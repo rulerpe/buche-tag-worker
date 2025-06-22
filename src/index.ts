@@ -12,7 +12,8 @@ import { DurableObject } from "cloudflare:workers";
 export interface Env {
 	CONTENT_BUCKET: R2Bucket;
 	CONTENT_DB: D1Database;
-	AI: Ai;
+	OPENROUTER_API_KEY: string;
+	OPENROUTER_API_URL: string;
 	TAGGING_QUEUE: Queue<QueueMessage>;
 	QUEUE_MANAGER: DurableObjectNamespace<QueueManager>;
 }
@@ -263,7 +264,7 @@ async function handleTagsListing(request: Request, env: Env): Promise<Response> 
 	if (request.method !== 'GET') {
 		return new Response('Method not allowed', { status: 405 });
 	}
-	
+	console.log('handleTagsListing');
 	try {
 		let query = 'SELECT id, name, created_at, usage_count FROM tags ORDER BY usage_count DESC';
 		const tags = await env.CONTENT_DB.prepare(query).all();
@@ -353,7 +354,7 @@ async function processSnippet(snippetId: string, env: Env, stats: TaggingStats):
 	const content = await r2Object.text();
 	
 	// Generate proposed tags using AI
-	const proposedTags = await generateProposedTags(content, env.AI);
+	const proposedTags = await generateProposedTags(content, env);
 	
 	// Process each proposed tag
 	const assignedTagIds: number[] = [];
@@ -374,20 +375,20 @@ async function processSnippet(snippetId: string, env: Env, stats: TaggingStats):
 	}
 }
 
-// Multi-agent tagging with 3 focused passes
-async function generateProposedTags(content: string, ai: Ai): Promise<string[]> {
+// Multi-agent tagging with 3 focused passes using OpenRouter
+async function generateProposedTags(content: string, env: Env): Promise<string[]> {
 	try {
 		// Truncate content if too long (AI models have token limits)
 		const truncatedContent = content.length > 2000 ? content.substring(0, 2000) + '...' : content;
 		
-		// Run all 3 passes sequentially to prevent AI capacity exceeded errors
-		const sexualActsTags = await generateSexualActsTags(truncatedContent, ai);
-		await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay between AI calls
+		// Run all 3 passes sequentially with shorter delays (OpenRouter has better rate limits)
+		const sexualActsTags = await generateSexualActsTags(truncatedContent, env);
+		await new Promise(resolve => setTimeout(resolve, 200)); // 200ms delay between AI calls
 		
-		const contextTags = await generateContextTags(truncatedContent, ai);
-		await new Promise(resolve => setTimeout(resolve, 500)); // 500ms delay between AI calls
+		const contextTags = await generateContextTags(truncatedContent, env);
+		await new Promise(resolve => setTimeout(resolve, 200)); // 200ms delay between AI calls
 		
-		const intensityTags = await generateIntensityTags(truncatedContent, ai);
+		const intensityTags = await generateIntensityTags(truncatedContent, env);
 		
 		// Combine all tags from the 3 passes
 		const allTags = [...sexualActsTags, ...contextTags, ...intensityTags];
@@ -404,20 +405,42 @@ async function generateProposedTags(content: string, ai: Ai): Promise<string[]> 
 	}
 }
 
-// Pass 1: Sexual acts and behaviors
-async function generateSexualActsTags(content: string, ai: Ai): Promise<string[]> {
-	try {
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
+// OpenRouter API helper function
+async function callOpenRouter(prompt: string, content: string, env: Env): Promise<string> {
+	const response = await fetch(env.OPENROUTER_API_URL, {
+		method: 'POST',
+		headers: {
+			'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+			'Content-Type': 'application/json',
+			'HTTP-Referer': 'https://buche-tag-worker.workers.dev',
+			'X-Title': 'Buche Tag Worker'
+		},
+		body: JSON.stringify({
+			model: 'deepseek/deepseek-r1-0528',
 			messages: [
 				{
 					role: 'user',
-					content: SEXUAL_ACTS_PROMPT + content
+					content: prompt + content
 				}
 			],
-			max_tokens: 50
-		}) as any;
-		
-		const result = response.response as string;
+			max_tokens: content ? 100 : 1500, // More tokens for consolidation (when content is empty)
+			temperature: 0.3
+		})
+	});
+
+	if (!response.ok) {
+		const errorText = await response.text();
+		throw new Error(`OpenRouter API error: ${response.status} - ${errorText}`);
+	}
+
+	const data = await response.json() as any;
+	return data.choices?.[0]?.message?.content || '';
+}
+
+// Pass 1: Sexual acts and behaviors
+async function generateSexualActsTags(content: string, env: Env): Promise<string[]> {
+	try {
+		const result = await callOpenRouter(SEXUAL_ACTS_PROMPT, content, env);
 		return parseTagResponse(result);
 		
 	} catch (error) {
@@ -427,19 +450,9 @@ async function generateSexualActsTags(content: string, ai: Ai): Promise<string[]
 }
 
 // Pass 2: Context and setting
-async function generateContextTags(content: string, ai: Ai): Promise<string[]> {
+async function generateContextTags(content: string, env: Env): Promise<string[]> {
 	try {
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
-			messages: [
-				{
-					role: 'user',
-					content: CONTEXT_SETTING_PROMPT + content
-				}
-			],
-			max_tokens: 50
-		}) as any;
-		
-		const result = response.response as string;
+		const result = await callOpenRouter(CONTEXT_SETTING_PROMPT, content, env);
 		return parseTagResponse(result);
 		
 	} catch (error) {
@@ -449,19 +462,9 @@ async function generateContextTags(content: string, ai: Ai): Promise<string[]> {
 }
 
 // Pass 3: Intensity and attributes
-async function generateIntensityTags(content: string, ai: Ai): Promise<string[]> {
+async function generateIntensityTags(content: string, env: Env): Promise<string[]> {
 	try {
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
-			messages: [
-				{
-					role: 'user',
-					content: INTENSITY_ATTRIBUTES_PROMPT + content
-				}
-			],
-			max_tokens: 50
-		}) as any;
-		
-		const result = response.response as string;
+		const result = await callOpenRouter(INTENSITY_ATTRIBUTES_PROMPT, content, env);
 		return parseTagResponse(result);
 		
 	} catch (error) {
@@ -697,7 +700,7 @@ async function handleTagConsolidation(request: Request, env: Env): Promise<Respo
 		}
 		
 		// Use AI to group similar tags
-		const consolidationPlan = await generateConsolidationPlan(allTags.results as unknown as Tag[], env.AI);
+		const consolidationPlan = await generateConsolidationPlan(allTags.results as unknown as Tag[], env);
 		
 		let consolidationsPerformed = 0;
 		const consolidationResults = [];
@@ -742,7 +745,7 @@ interface ConsolidationGroup {
 	reason: string;
 }
 
-async function generateConsolidationPlan(tags: Tag[], ai: Ai): Promise<ConsolidationGroup[]> {
+async function generateConsolidationPlan(tags: Tag[], env: Env): Promise<ConsolidationGroup[]> {
 	const tagList = tags.map(tag => `${tag.id}:${tag.name} (使用了 ${tag.usageCount} 次)`).join('\n');
 	
 	const prompt = `分析这些内容标签，将相似的标签分组进行合并。重点关注语义相似性：
@@ -777,17 +780,7 @@ ${tagList}
 只包含有2个或更多标签的组。如果没有标签应该分组，返回空的consolidations数组。`;
 
 	try {
-		const response = await ai.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
-			messages: [
-				{
-					role: 'user',
-					content: prompt
-				}
-			],
-			max_tokens: 1500 // Increased from 500 to handle larger responses
-		}) as any;
-		
-		const result = response.response as string;
+		const result = await callOpenRouter(prompt, '', env);
 		
 		// Parse AI response with improved error handling
 		let aiPlan;
@@ -1335,8 +1328,8 @@ async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, ctx: Exe
 	
 	await initializeDatabase(env.CONTENT_DB);
 	
-	// Process messages with rate limiting (reduced to 1 to prevent AI capacity exceeded errors)
-	const CONCURRENT_LIMIT = 1;
+	// Process messages with higher concurrency since OpenRouter has better rate limits
+	const CONCURRENT_LIMIT = 3;
 	const chunks = chunkArray([...batch.messages], CONCURRENT_LIMIT);
 	
 	for (const chunk of chunks) {
@@ -1401,7 +1394,7 @@ async function handleQueueBatch(batch: MessageBatch<unknown>, env: Env, ctx: Exe
 		
 		// Add delay between chunks to prevent overwhelming the AI API
 		if (chunks.indexOf(chunk) < chunks.length - 1) {
-			await new Promise(resolve => setTimeout(resolve, 2000)); // Increased to 2 seconds
+			await new Promise(resolve => setTimeout(resolve, 500)); // Reduced to 0.5 seconds for OpenRouter
 		}
 	}
 }
