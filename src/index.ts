@@ -419,7 +419,7 @@ async function callOpenRouter(prompt: string, content: string, env: Env): Promis
 			'X-Title': 'Buche Tag Worker'
 		},
 		body: JSON.stringify({
-			model: 'deepseek/deepseek-r1-0528',
+			model: 'deepseek/deepseek-r1-0528:free',
 			messages: [
 				{
 					role: 'user',
