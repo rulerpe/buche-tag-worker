@@ -409,6 +409,7 @@ async function generateProposedTags(content: string, env: Env): Promise<string[]
 
 // OpenRouter API helper function
 async function callOpenRouter(prompt: string, content: string, env: Env): Promise<string> {
+	console.log('callOpenRouter', prompt, content);
 	const response = await fetch(env.OPENROUTER_API_URL, {
 		method: 'POST',
 		headers: {
@@ -436,6 +437,7 @@ async function callOpenRouter(prompt: string, content: string, env: Env): Promis
 	}
 
 	const data = await response.json() as any;
+	console.log('callOpenRouter data', data);
 	return data.choices?.[0]?.message?.content || '';
 }
 
@@ -443,6 +445,7 @@ async function callOpenRouter(prompt: string, content: string, env: Env): Promis
 async function generateSexualActsTags(content: string, env: Env): Promise<string[]> {
 	try {
 		const result = await callOpenRouter(SEXUAL_ACTS_PROMPT, content, env);
+		console.log('generateSexualActsTags result', result);
 		return parseTagResponse(result);
 		
 	} catch (error) {
@@ -455,6 +458,7 @@ async function generateSexualActsTags(content: string, env: Env): Promise<string
 async function generateContextTags(content: string, env: Env): Promise<string[]> {
 	try {
 		const result = await callOpenRouter(CONTEXT_SETTING_PROMPT, content, env);
+		console.log('generateContextTags result', result);
 		return parseTagResponse(result);
 		
 	} catch (error) {
@@ -467,6 +471,7 @@ async function generateContextTags(content: string, env: Env): Promise<string[]>
 async function generateIntensityTags(content: string, env: Env): Promise<string[]> {
 	try {
 		const result = await callOpenRouter(INTENSITY_ATTRIBUTES_PROMPT, content, env);
+		console.log('generateIntensityTags result', result);
 		return parseTagResponse(result);
 		
 	} catch (error) {
