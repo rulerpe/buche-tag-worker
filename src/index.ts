@@ -383,13 +383,15 @@ async function generateProposedTags(content: string, env: Env): Promise<string[]
 		
 		// Run all 3 passes sequentially with shorter delays (OpenRouter has better rate limits)
 		const sexualActsTags = await generateSexualActsTags(truncatedContent, env);
+		console.log('sexualActsTags', sexualActsTags);
 		await new Promise(resolve => setTimeout(resolve, 200)); // 200ms delay between AI calls
 		
 		const contextTags = await generateContextTags(truncatedContent, env);
+		console.log('contextTags', contextTags);
 		await new Promise(resolve => setTimeout(resolve, 200)); // 200ms delay between AI calls
 		
 		const intensityTags = await generateIntensityTags(truncatedContent, env);
-		
+		console.log('intensityTags', intensityTags);
 		// Combine all tags from the 3 passes
 		const allTags = [...sexualActsTags, ...contextTags, ...intensityTags];
 		
