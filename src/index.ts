@@ -417,14 +417,13 @@ async function generateProposedTags(content: string, ai: Ai): Promise<string[]> 
 		console.log('sexualActsTags', sexualActsTags);
 		await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay between AI calls
 		
-		// const contextTags = await generateContextTags(truncatedContent, ai);
-		// console.log('contextTags', contextTags);
-		// await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay between AI calls
+		const contextTags = await generateContextTags(truncatedContent, ai);
+		console.log('contextTags', contextTags);
+		await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay between AI calls
 		
-		// const intensityTags = await generateIntensityTags(truncatedContent, ai);
-		// console.log('intensityTags', intensityTags);
-		const contextTags: string[] = [];
-		const intensityTags: string[] = [];
+		const intensityTags = await generateIntensityTags(truncatedContent, ai);
+		console.log('intensityTags', intensityTags);
+	
 		// Combine all tags from the 3 passes
 		const allTags = [...sexualActsTags, ...contextTags, ...intensityTags];
 		
@@ -489,7 +488,7 @@ async function generateContextTags(content: string, ai: Ai): Promise<string[]> {
 // Pass 3: Intensity and attributes
 async function generateIntensityTags(content: string, ai: Ai): Promise<string[]> {
 	try {
-		const response = await ai.run('@cf/qwen/qwen1.5-0.5b-chat', {
+		const response = await ai.run('@cf/qwen/qwen1.5-1.8b-chat', {
 			messages: [
 				{
 					role: 'user',
