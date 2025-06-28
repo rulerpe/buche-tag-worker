@@ -7,7 +7,7 @@
  * - Limits global tag set to 20-30 tags
  * - Stores tag relationships in D1 database
  */
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
 
 export interface Env {
 	CONTENT_BUCKET: R2Bucket;
@@ -142,6 +142,51 @@ const INTENSITY_ATTRIBUTES_PROMPT = `分析这段情色内容的强度和情感�
 浪漫
 
 内容：`;
+
+// RPC Entrypoint class for service bindings
+export class TagWorkerEntrypoint extends WorkerEntrypoint<Env> {
+	/**
+	 * Simple test method to verify RPC is working
+	 */
+	async ping() {
+		return {
+			success: true,
+			data: {
+				message: "pong",
+				timestamp: new Date().toISOString(),
+				worker: "tag-worker"
+			}
+		};
+	}
+
+	/**
+	 * Get worker status and database statistics
+	 */
+	async getStatus() {
+		return await handleStatusForEntrypoint(this.env);
+	}
+
+	/**
+	 * Get all tags with usage counts
+	 */
+	async getTags() {
+		return await handleTagsListingForEntrypoint(this.env);
+	}
+
+	/**
+	 * Start queue-based tagging process
+	 */
+	async startQueueTagging() {
+		return await handleQueueTaggingForEntrypoint(this.env);
+	}
+
+	/**
+	 * Get queue processing progress
+	 */
+	async getQueueProgress() {
+		return await handleQueueProgressForEntrypoint(this.env);
+	}
+}
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -1762,5 +1807,98 @@ export class QueueManager extends DurableObject {
 			
 			await this.ctx.storage.put('progress', progress);
 		}
+	}
+}
+
+// RPC-specific handler functions that return data instead of Response objects
+async function handleStatusForEntrypoint(env: Env) {
+	try {
+		const [snippetsResult, tagsResult, taggedResult] = await Promise.all([
+			env.CONTENT_DB.prepare('SELECT COUNT(*) as count FROM snippets').first(),
+			env.CONTENT_DB.prepare('SELECT COUNT(*) as count FROM tags').first(),
+			env.CONTENT_DB.prepare('SELECT COUNT(*) as count FROM snippets WHERE tags IS NOT NULL AND tags != "[]"').first()
+		]);
+		const totalSnippets = (snippetsResult?.count as number) || 0;
+		const totalTags = (tagsResult?.count as number) || 0;
+		const taggedSnippets = (taggedResult?.count as number) || 0;
+		
+		return {
+			success: true,
+			data: {
+				totalSnippets,
+				totalTags,
+				taggedSnippets,
+				untaggedSnippets: totalSnippets - taggedSnippets,
+				status: 'active'
+			}
+		};
+	} catch (error) {
+		return {
+			success: false,
+			error: 'Database not initialized',
+			status: 'inactive'
+		};
+	}
+}
+
+async function handleTagsListingForEntrypoint(env: Env) {
+	try {
+		let query = 'SELECT id, name, created_at, usage_count FROM tags ORDER BY usage_count DESC';
+		const tags = await env.CONTENT_DB.prepare(query).all();
+		
+		return {
+			success: true,
+			data: {
+				tags: tags.results,
+				totalTags: tags.results.length
+			}
+		};
+	} catch (error) {
+		return {
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		};
+	}
+}
+
+async function handleQueueTaggingForEntrypoint(env: Env) {
+	try {
+		// Get the QueueManager Durable Object
+		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
+		const doStub = env.QUEUE_MANAGER.get(doId);
+		
+		// Start queuing via RPC method
+		const result = await doStub.startQueuing();
+		
+		return {
+			success: true,
+			data: result
+		};
+	} catch (error) {
+		return {
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		};
+	}
+}
+
+async function handleQueueProgressForEntrypoint(env: Env) {
+	try {
+		// Get the QueueManager Durable Object
+		const doId = env.QUEUE_MANAGER.idFromName("snippet-queue-manager");
+		const doStub = env.QUEUE_MANAGER.get(doId);
+		
+		// Get progress via RPC method
+		const progress = await doStub.getProgress();
+		
+		return {
+			success: true,
+			data: progress
+		};
+	} catch (error) {
+		return {
+			success: false,
+			error: error instanceof Error ? error.message : String(error)
+		};
 	}
 }
